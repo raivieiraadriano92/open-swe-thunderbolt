@@ -120,6 +120,16 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
     model_kwargs: dict[str, object] = kwargs.copy()
     model_kwargs.setdefault("max_retries", DEFAULT_MAX_RETRIES)
 
+    # --- THU-696 PoC: route all model calls through OpenRouter ---
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return init_chat_model(
+            model="anthropic/claude-sonnet-4.6",
+            model_provider="openai",
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.environ["OPENROUTER_API_KEY"],
+        )
+    # --- end THU-696 patch ---
+
     if model_id.startswith("openai:"):
         # Direct-provider default: Responses API over the OpenAI websocket base.
         # Gateway routing overrides this below (an HTTP(S) proxy can't carry wss).
