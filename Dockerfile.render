@@ -5,7 +5,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends git curl \
 RUN pip install --no-cache-dir uv
 
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
+# hatchling validates the readme file exists during metadata parsing, so it
+# has to be present alongside pyproject.toml + uv.lock in the deps layer.
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --all-extras --frozen --no-dev
 
 COPY . .
