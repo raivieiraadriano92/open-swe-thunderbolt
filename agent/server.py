@@ -369,12 +369,34 @@ async def _refresh_github_proxy_or_recreate(
     return sandbox_backend
 
 
-async def _configure_git_identity(sandbox_backend: SandboxBackendProtocol) -> None:
-    await asyncio.to_thread(
-        sandbox_backend.execute,
+async def _configure_git_identity(
+    sandbox_backend: SandboxBackendProtocol,
+    github_token: str | None = None,
+) -> None:
+    setup = (
         f"git config --global user.name '{OPEN_SWE_BOT_NAME}' && "
-        f"git config --global user.email '{OPEN_SWE_BOT_EMAIL}'",
+        f"git config --global user.email '{OPEN_SWE_BOT_EMAIL}'"
     )
+    # THU-696: enable git push in bot-token-only mode without needing `gh`
+    # in the sandbox image. Writes the App installation token as a credential
+    # helper entry for github.com. Token is short-lived (~1h) and scoped to
+    # the installation, and the sandbox is ephemeral.
+    #
+    # The main agent graph calls this without passing github_token (it doesn't
+    # thread `github_proxy_token` through — only the reviewer graph does), so
+    # fall back to minting a bot-mode installation token directly here.
+    if not github_token:
+        try:
+            github_token, _ = await get_github_app_installation_token_with_expiry()
+        except Exception:  # noqa: BLE001
+            github_token = None
+    if github_token:
+        setup += (
+            " && git config --global credential.helper 'store --file=/tmp/.git-creds'"
+            f" && printf '%s\\n' 'https://x-access-token:{github_token}@github.com' > /tmp/.git-creds"
+            " && chmod 600 /tmp/.git-creds"
+        )
+    await asyncio.to_thread(sandbox_backend.execute, setup)
 
 
 async def _recreate_sandbox(
@@ -507,7 +529,7 @@ async def ensure_sandbox_for_thread(
             thread_id=thread_id, metadata={"sandbox_id": sandbox_backend.id}
         )
 
-    await _configure_git_identity(sandbox_backend)
+    await _configure_git_identity(sandbox_backend, github_token=github_proxy_token)
 
     return sandbox_backend
 
