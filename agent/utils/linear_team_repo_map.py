@@ -1,7 +1,7 @@
 from typing import Any
 
 LINEAR_TEAM_TO_REPO: dict[str, dict[str, Any] | dict[str, str]] = {
-    "Thunderbolt": {"owner": "raivieiraadriano92", "name": "thunderbolt-openswe-poc"},
+    "Thunderbolt": {"owner": "thunderbird", "name": "thunderbolt-sandbox"},
     "Brace's test workspace": {"owner": "langchain-ai", "name": "open-swe"},
     "Yogesh-dev": {
         "projects": {
