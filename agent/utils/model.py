@@ -109,6 +109,24 @@ def _configure_openai_responses_kwargs(model_kwargs: dict[str, object]) -> None:
         include.append("reasoning.encrypted_content")
 
 
+def _mark_last_text_part(msg: dict) -> None:
+    """THU-696: add cache_control ephemeral to a message's last text part.
+
+    Converts string content to structured form when needed. Idempotent.
+    """
+    content = msg.get("content")
+    if isinstance(content, str):
+        msg["content"] = [
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+        ]
+        return
+    if isinstance(content, list):
+        for part in reversed(content):
+            if isinstance(part, dict) and part.get("type") == "text":
+                part.setdefault("cache_control", {"type": "ephemeral"})
+                return
+
+
 def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpack[ModelKwargs]):
     """Build a chat model, optionally routed through the LangSmith LLM Gateway.
 
@@ -122,12 +140,38 @@ def make_model(model_id: str, *, use_gateway: bool | None = None, **kwargs: Unpa
 
     # --- THU-696 PoC: route all model calls through OpenRouter ---
     if os.environ.get("OPENROUTER_API_KEY"):
-        return init_chat_model(
+        model = init_chat_model(
             model="anthropic/claude-sonnet-4.6",
             model_provider="openai",
             base_url="https://openrouter.ai/api/v1",
             api_key=os.environ["OPENROUTER_API_KEY"],
         )
+        # THU-696 cache-marker injection: Open SWE does not emit any
+        # `cache_control` markers in production code. OpenRouter (and
+        # Anthropic direct) require explicit markers for prompt caching.
+        # Wrap `_get_request_payload` so the built payload gets cache_control
+        # added to the system message and the last user/tool turn — the two
+        # cacheable prefixes recommended for agentic loops.
+        _original_payload = model._get_request_payload  # type: ignore[attr-defined]
+
+        def _payload_with_cache(input_, *, stop=None, **kw):
+            payload = _original_payload(input_, stop=stop, **kw)
+            messages = payload.get("messages") or []
+            # Find and mark the system message (largest stable prefix).
+            for m in messages:
+                if m.get("role") == "system":
+                    _mark_last_text_part(m)
+                    break
+            # Mark the last user/tool message — captures the growing prefix
+            # across agent turns.
+            for m in reversed(messages):
+                if m.get("role") in ("user", "tool"):
+                    _mark_last_text_part(m)
+                    break
+            return payload
+
+        model._get_request_payload = _payload_with_cache  # type: ignore[attr-defined]
+        return model
     # --- end THU-696 patch ---
 
     if model_id.startswith("openai:"):
