@@ -30,7 +30,9 @@ Linear webhook ───► Render Web Service (Docker) ───► LangGraph A
                     │  open-swe-poc.onrender.com          │
                     │  1 × Standard 2GB                   │
                     │  langgraph dev --no-reload          │
-                    │  in-memory checkpointer             │
+                    │  pickle-file persistence            │
+                    │  → Render Persistent Disk (1 GB)    │
+                    │    mounted at /app/.langgraph_api   │
                     │                                     ├──► External vendors:
                     │                                     │    • OpenRouter    (LLM routing → Anthropic/OpenAI/etc.)
                     │                                     │    • Daytona       (sandbox execution — ephemeral containers)
@@ -45,7 +47,37 @@ GitHub App webhook ─┘ (deferred — needs org admin to activate on Thunderbo
                        CI-iteration + review-response feedback loops depend on it)
 ```
 
-**Not provisioned:** Postgres, Redis. In-memory checkpointer suffices for PoC (per-task <2 min, no cross-restart resume required). Production would add both for durability.
+**Persistence:** Render Persistent Disk mounted at `/app/.langgraph_api` catches the pickle files LangGraph's inmem runtime writes. Survives restarts, deploys, container recreation. Single-writer only — caps scaling to one instance, which is not a bottleneck at Thunderbolt's usage pattern (one team, one repo, sub-10 concurrent runs). Cost: $0.25/mo.
+
+**Not chosen — LangGraph Platform paid runtime.** See §*"LangGraph Platform licensing"* below for why postgres-backed persistence would require either a paid LangChain license or a custom OSS wrapper.
+
+---
+
+## LangGraph Platform licensing
+
+Attempted upgrade path from pickle-file persistence to Postgres-backed persistence via `python -m langgraph_api.cli --runtime-edition postgres` failed on boot:
+
+```
+ImportError: Langgraph runtime backend not found.
+Please install with `pip install "langgraph-runtime-postgres"`
+```
+
+`langgraph-runtime-postgres` is not on public PyPI (verified: HTTP 404 on `pypi.org/pypi/langgraph-runtime-postgres/json`). Same for `langgraph-runtime-community`. Only `langgraph-runtime-inmem` is publicly available.
+
+`langgraph_cli/cli.py:298` documents the paid-tier requirement: **"For production use, requires a license key in env var `LANGGRAPH_CLOUD_LICENSE_KEY`."** References to `langchain/langgraph-orchestrator-licensed`, `langchain/langgraph-trial`, and `LANGGRAPH_CLOUD_LICENSE_KEY` throughout the CLI confirm that LangGraph's Postgres-backed self-hosted deployment is a commercial LangSmith Platform feature.
+
+**Free options for production-grade persistence:**
+
+1. **Render Persistent Disk + `langgraph dev`** ← chosen. Ceiling: single-instance. No license required. $0.25/mo.
+2. **Custom FastAPI wrapper** using OSS `langgraph-checkpoint-postgres` + `langgraph-store-postgres`. Replaces `langgraph_api` entirely. ~3–5 days of work; ~500 LOC. No LangChain dependency at runtime.
+3. **`langchain/langgraph-trial` Docker base image** — free eval variant with time/scale limits. Would work for extended PoC but not for real production.
+
+**Paid options:**
+
+4. **LangGraph Platform Self-Hosted** — enterprise-priced Docker license from LangChain. Postgres runtime works out of the box.
+5. **LangGraph Platform Cloud** — fully hosted SaaS. Sends prompts through LangChain's infra. Rejected for THU-696's "no LangSmith" evaluation goal.
+
+Adoption decision for stakeholders: the "we self-host Open SWE cheaply" narrative holds only up to single-instance scale via option 1. Beyond that, options 2 or 4 are the honest paths.
 
 ---
 

@@ -4,13 +4,18 @@ Companion checklist to [`THUNDERBOLT.md`](./THUNDERBOLT.md). Items are grouped b
 
 ## Immediate (can start now)
 
-- [ ] **Provision Postgres + Redis on Render, switch LangGraph off pickle-file dev-mode**
-  - Create free-tier Render Postgres (`open-swe-poc-db`) → set `DATABASE_URI` on backend.
-  - Create free-tier Render Key Value (`open-swe-poc-kv`) → set `REDIS_URI` on backend.
-  - Swap `Dockerfile.render` CMD from `langgraph dev` to `python -m langgraph_api.cli --runtime-edition postgres`.
-  - Verify: (1) in-flight thread state survives a service restart; (2) LangGraph Store data (per-user OAuth tokens, feedback events, per-repo review-style profiles) persists across restarts.
-  - Update `THUNDERBOLT.md` persistence section.
-  - **Redis note:** LangGraph API's `postgres` runtime edition hard-requires `REDIS_URI` (no default in `langgraph_api/config/__init__.py:149`). Even though our app code doesn't use Redis, we cannot opt out at this layer.
+- [ ] **Attach Render Persistent Disk to `/app/.langgraph_api` (persistence approach chosen)**
+  - No code change — pure Render config. Dashboard → `open-swe-poc` → **Disks** → **Add Disk**: name `langgraph-state`, mount path `/app/.langgraph_api`, size `1 GB`.
+  - Cost: $0.25/mo.
+  - Verify: trigger a small run → restart service via Render UI → confirm thread still visible.
+  - Persists: in-flight thread state, LangGraph Store (OAuth tokens, feedback, review-style profiles, thread message queues), ops queue, retry counter.
+  - Trade-off: pins us to single-instance scale. Acceptable — Thunderbolt's usage pattern (one team, one repo, sub-10 concurrent runs) is nowhere near that limit.
+
+- [ ] **Document the LangGraph Platform licensing finding in the report**
+  - `langgraph-runtime-postgres` / `langgraph-runtime-community` are **not on public PyPI** — only `-inmem` is.
+  - `langgraph up` / `langgraph build` produce images that require `LANGGRAPH_CLOUD_LICENSE_KEY` for production (see `langgraph_cli/cli.py:298` + `langchain/langgraph-orchestrator-licensed` image reference).
+  - Real production options: (1) buy LangGraph Platform Self-Hosted license, (2) build a custom FastAPI wrapper using OSS `langgraph-checkpoint-postgres`, (3) use `langchain/langgraph-trial` free image, (4) stay on `langgraph dev` + persistent disk (what we chose).
+  - Material for stakeholders — adoption decision depends on this.
 
 - [ ] **Run 1–2 varied tickets beyond README edits**
   - Current cost/latency data is entirely from trivial README-touching tasks.
@@ -39,7 +44,7 @@ Companion checklist to [`THUNDERBOLT.md`](./THUNDERBOLT.md). Items are grouped b
   - Screenshot for the final report as "why adopt" evidence.
 
 - [ ] **Trigger review-style analyzer on `thunderbolt-sandbox`**
-  - Depends on Postgres too (Store persistence needed to see the synthesized prompt survive).
+  - Depends on Render Persistent Disk being attached (Store persistence needed to see the synthesized prompt survive restart).
   - Dashboard → click "Analyze style" for the repo → wait for the analyzer graph to finish.
   - Compare the synthesized prompt to our real `CLAUDE.md`. How close does it come?
   - Novel capability worth calling out in the report as "consider adapting."
@@ -62,6 +67,6 @@ Companion checklist to [`THUNDERBOLT.md`](./THUNDERBOLT.md). Items are grouped b
     2. What worked / what didn't.
     3. 8-patch summary + maintenance burden going forward.
     4. Cost data across ticket variety.
-    5. Production-readiness matrix (Postgres ✓, sandbox ✓, teardown ✓, dashboard ✓, plan-approval ✓, review-style ✓, Redis ○ at scale).
+    5. Production-readiness matrix (persistence via disk ✓, sandbox ✓, teardown ✓, dashboard ✓, plan-approval ✓, review-style ✓; Postgres/multi-instance needs custom wrapper or paid license).
     6. Risks / caveats.
     7. Next steps if adopted.
