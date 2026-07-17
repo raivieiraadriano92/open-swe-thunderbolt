@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 # follow-up halts the prior run (status "interrupted") while its replacement
 # carries on — that's healthy, not a failure worth a "couldn't finish" reply.
 _TERMINAL_FAILURE_STATUSES = frozenset({"error", "timeout"})
+# THU-696: destroy the Daytona sandbox on any terminal status except
+# "interrupted" — an interrupted run's successor inherits the same thread and
+# sandbox, so we must not tear it down for the successor.
+_TERMINAL_STATUSES_FOR_CLEANUP = frozenset({"success", "error", "timeout"})
 _FAILURE_REPLY_FLAG = "failure_reply_posted"
 _FAILURE_REPLY_RUN_ID = "failure_reply_posted_run_id"
 _FAILURE_REPLY_RUN_IDS = "failure_reply_posted_run_ids"
@@ -140,6 +144,53 @@ def _failure_reply_metadata(metadata: dict[str, Any], run_id: str | None) -> dic
     }
 
 
+async def _cleanup_daytona_sandbox_for_thread(thread_id: str) -> None:
+    """THU-696: destroy the Daytona sandbox bound to this thread.
+
+    Upstream Open SWE has no teardown path for Daytona sandboxes (only the
+    LangSmith proxy code deletes on completion). Since our
+    ``agent/integrations/daytona.py`` patch creates sandboxes with
+    ``ephemeral=True``, calling ``daytona.delete()`` here removes the sandbox
+    immediately, avoiding the ``auto_stop_interval`` idle-wait.
+
+    Best-effort: never raises. Runs only when ``SANDBOX_TYPE=daytona``.
+    """
+    if os.environ.get("SANDBOX_TYPE", "").lower() != "daytona":
+        return
+    api_key = os.environ.get("DAYTONA_API_KEY")
+    if not api_key:
+        return
+    try:
+        import asyncio
+
+        from daytona import Daytona, DaytonaConfig
+
+        from .utils.sandbox_state import SANDBOX_BACKENDS, get_sandbox_id_from_metadata
+
+        sandbox_id = await get_sandbox_id_from_metadata(thread_id)
+        if not sandbox_id:
+            return
+
+        def _delete() -> None:
+            daytona = Daytona(config=DaytonaConfig(api_key=api_key))
+            sandbox = daytona.get(sandbox_id)
+            daytona.delete(sandbox)
+
+        await asyncio.to_thread(_delete)
+        SANDBOX_BACKENDS.pop(thread_id, None)
+        logger.info(
+            "THU-696 teardown: destroyed Daytona sandbox %s for thread %s",
+            sandbox_id,
+            thread_id,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "THU-696 teardown: failed to destroy Daytona sandbox for thread %s",
+            thread_id,
+            exc_info=True,
+        )
+
+
 async def handle_run_completion(payload: dict[str, Any]) -> dict[str, str]:
     """Handle a platform run-completion webhook POST.
 
@@ -152,6 +203,14 @@ async def handle_run_completion(payload: dict[str, Any]) -> dict[str, str]:
     run_id = raw_run_id if isinstance(raw_run_id, str) and raw_run_id else None
     if not isinstance(thread_id, str) or not thread_id:
         return {"status": "ignored", "reason": "missing thread_id"}
+
+    # THU-696: teardown the sandbox before other completion work. Deliberately
+    # runs on success/error/timeout — but not "interrupted" (successor run
+    # inherits the sandbox). Fire-and-forget so a slow/failed teardown never
+    # blocks the failure-reply logic below.
+    if status in _TERMINAL_STATUSES_FOR_CLEANUP:
+        await _cleanup_daytona_sandbox_for_thread(thread_id)
+
     if status not in _TERMINAL_FAILURE_STATUSES:
         return {"status": "ignored", "reason": f"non-failure status: {status}"}
 
