@@ -8,43 +8,48 @@ This fork evaluates [Open SWE](https://github.com/langchain-ai/open-swe) as a ti
 
 ---
 
-## Result — six test rounds
+## Result — seven test rounds
 
-| # | Where | Model | Cache markers | Wall | Calls | Cost | Sandbox teardown | Outcome |
+| # | Where | Trigger | Model | Cache | Wall | Cost | Teardown | Outcome |
 |---|---|---|---|---|---|---|---|---|
-| 1 | Local (personal fork target) | `anthropic/claude-sonnet-4.6` | ❌ | 13m 43s | 137 | **$20.00** | — | ✗ credit exhausted before push |
-| 2 | Local | `openai/gpt-5.6-sol` | ❌ | 1m 43s | 16 | $0.54 | — | ✗ push failed (no `gh` in sandbox) |
-| 3 | Local + git-auth patch | `openai/gpt-5.6-sol` | ❌ | 0m 33s | 11 | $0.26 | manual | ✅ PR |
-| 4 | Local + patches 1-7 | `anthropic/claude-sonnet-4.6` | ✅ | 1m 29s | 17 | $0.17 | manual | ✅ PR |
-| 5 | **Render (thunderbolt-sandbox target)** | `anthropic/claude-sonnet-4.6` | ✅ | 0m 56s | ~15 | $0.24 | idle-wait (~15m) | ✅ PR |
-| 6 | **Render + patch #8** | `anthropic/claude-sonnet-4.6` | ✅ | **1m 16s** | ~15 | **$0.23** | **auto (19s after PR)** | ✅ **PR on production sandbox repo** |
+| 1 | Local (personal fork) | Linear | `anthropic/claude-sonnet-4.6` | ❌ | 13m 43s | **$20.00** | — | ✗ credit exhausted |
+| 2 | Local | Linear | `openai/gpt-5.6-sol` | ❌ | 1m 43s | $0.54 | — | ✗ push failed (no `gh`) |
+| 3 | Local + git-auth patch | Linear | `openai/gpt-5.6-sol` | ❌ | 0m 33s | $0.26 | manual | ✅ PR |
+| 4 | Local + patches 1-7 | Linear | `anthropic/claude-sonnet-4.6` | ✅ | 1m 29s | $0.17 | manual | ✅ PR |
+| 5 | Render (sandbox target) | Linear | `anthropic/claude-sonnet-4.6` | ✅ | 0m 56s | $0.24 | idle-wait (~15m) | ✅ PR |
+| 6 | Render + patch #8 | Linear | `anthropic/claude-sonnet-4.6` | ✅ | **1m 16s** | **$0.23** | **auto (19s)** | ✅ PR |
+| 7 | Render (dashboard + disk) | **GitHub `@openswe`** | `anthropic/claude-sonnet-4.6` | ✅ | **1m 35s** | ~$0.24* | auto | ✅ PR #6 closes issue #5 |
 
-**Headline:** Sonnet 4.6 + cache markers on Render = **117× cheaper** than the same model without markers. Sandbox teardown patch cuts Daytona bill **~90% per task**.
+*Round 7 cost extrapolated from Round 6; not directly measured.
+
+**Headline:** Sonnet 4.6 + cache markers on Render = **117× cheaper** than the same model without markers. Sandbox teardown patch cuts Daytona bill **~90% per task**. **Two trigger surfaces (Linear ✓, GitHub ✓) validated end-to-end at the same latency/cost shape.**
 
 ---
 
 ## Deploy topology
 
 ```
-Linear webhook ───► Render Web Service (Docker) ───► LangGraph API + FastAPI
-                    │  open-swe-poc.onrender.com          │
-                    │  1 × Standard 2GB                   │
-                    │  langgraph dev --no-reload          │
-                    │  pickle-file persistence            │
-                    │  → Render Persistent Disk (1 GB)    │
-                    │    mounted at /app/.langgraph_api   │
-                    │                                     ├──► External vendors:
-                    │                                     │    • OpenRouter    (LLM routing → Anthropic/OpenAI/etc.)
-                    │                                     │    • Daytona       (sandbox execution — ephemeral containers)
-                    │                                     │    • GitHub App    (Thunderbolt Automation Agent — thunderbird/thunderbolt-sandbox only)
-                    │                                     │    • Linear API    (comment writes, webhook receiver)
-                    │                                     │
-                    │                                     └──► DOES NOT talk to:
-                    │                                          • smith.langchain.com   (LangSmith — bypassed, see §7)
-                    │                                          • Any user's browser    (unless viewing via LangGraph Studio SPA)
+Linear webhook ────►┐
                     │
-GitHub App webhook ─┘ (deferred — needs org admin to activate on Thunderbolt Automation Agent App;
-                       CI-iteration + review-response feedback loops depend on it)
+GitHub App webhook ─┤   Render Web Service (Docker) ───► LangGraph API + FastAPI
+                    ├──►  open-swe-poc.onrender.com          │
+Dashboard SPA ──────┘    1 × Standard 2GB                    │
+                         langgraph dev --no-reload           │
+                         pickle-file persistence             │
+                         → Render Persistent Disk (1 GB)     │
+                         mounted at /app/.langgraph_api      │
+                                                             ├──► External vendors:
+                                                             │    • OpenRouter (LLM routing → Anthropic/OpenAI/etc.)
+                                                             │    • Daytona    (sandbox execution — ephemeral containers)
+                                                             │    • GitHub App (Thunderbolt Automation Agent — thunderbolt-sandbox only)
+                                                             │    • Linear API (comment writes, webhook receiver)
+                                                             │
+                                                             └──► DOES NOT talk to:
+                                                                  • smith.langchain.com  (LangSmith — bypassed, see §7)
+                                                                  • Any user's browser   (except the Studio SPA + our Dashboard)
+
+Dashboard SPA:  open-swe-poc-ui.onrender.com (Render Static Site, free) → talks to backend at
+                open-swe-poc.onrender.com only.  OAuth login via the same GitHub App.
 ```
 
 **Persistence:** Render Persistent Disk mounted at `/app/.langgraph_api` catches the pickle files LangGraph's inmem runtime writes. Survives restarts, deploys, container recreation. Single-writer only — caps scaling to one instance, which is not a bottleneck at Thunderbolt's usage pattern (one team, one repo, sub-10 concurrent runs). Cost: $0.25/mo.
@@ -78,6 +83,66 @@ Please install with `pip install "langgraph-runtime-postgres"`
 5. **LangGraph Platform Cloud** — fully hosted SaaS. Sends prompts through LangChain's infra. Rejected for THU-696's "no LangSmith" evaluation goal.
 
 Adoption decision for stakeholders: the "we self-host Open SWE cheaply" narrative holds only up to single-instance scale via option 1. Beyond that, options 2 or 4 are the honest paths.
+
+---
+
+## Dashboard deployment + GitHub-trigger findings
+
+### Dashboard is a Render Static Site — free tier, one rewrite rule
+
+Open SWE ships a full TanStack Start / Vite SPA under `ui/`. Configured with `spa: { enabled: true }` and no `createServerFn` usage, so it builds to pure static output. Deployed at `open-swe-poc-ui.onrender.com` (Render Static Site, free tier). One SPA rewrite rule (`/* → /_shell.html`, 200 rewrite) because Nitro emits `_shell.html` instead of `index.html`.
+
+**Zero code changes** in the UI folder. Just a Render Static Site + build command `pnpm install --frozen-lockfile && pnpm build`, publish dir `.output/public`.
+
+**Backend CORS already correct** — `agent/api/app.py:32` uses `allow_credentials=True` with explicit-origin allowlist and refuses `*` at boot. Set `DASHBOARD_ALLOWED_ORIGINS=https://open-swe-poc-ui.onrender.com` and it just works.
+
+**OAuth reuses the same GitHub App** used by the bot (App ID `4316868`, Client ID `Iv23liPKkL9jFVh8pdlN`). No second OAuth App required. Adds: `GITHUB_APP_CLIENT_SECRET`, `DASHBOARD_JWT_SECRET`, `DASHBOARD_BASE_URL`, `DASHBOARD_API_BASE_URL`, and a **Callback URL** entry in the App settings.
+
+### GitHub-trigger gotcha #1: user-email mapping is a silent gate
+
+**Documented behavior:** commenting `@openswe` on an issue in `ALLOWED_GITHUB_REPOS` triggers a run.
+
+**Undocumented behavior:** if the commenter's GitHub login has no mapping to a work email in the LangGraph Store, the webhook silently returns HTTP 200 and does nothing. `agent/webhooks/github.py:898-901` bails on `if not email:`. No comment reaction. No dashboard entry. Just a "No email mapping for GitHub user '<login>'" log line — invisible unless you're tailing Render logs.
+
+**Fix:** seed a mapping via LangGraph SDK before the first GitHub-triggered run. Minimal script:
+
+```python
+from langgraph_sdk import get_client
+import asyncio, datetime
+
+async def main():
+    client = get_client(url="https://<render-url>")
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    await client.store.put_item(["user_mappings"], "<github-login>", {
+        "github_login": "<github-login>",
+        "work_email": "<their-email>",
+        "source": "poc_seed",
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+    })
+
+asyncio.run(main())
+```
+
+For a real adoption, seed one mapping per triggering user OR add a code patch that falls back to `<login>@users.noreply.github.com` when no mapping exists.
+
+### GitHub-trigger gotcha #2: user-mapping cache is process-lifetime
+
+After seeding a fresh mapping, the running server won't pick it up because `dashboard/user_mappings.py:_ensure_cache_loaded` only fetches from the Store once per process. Restart the service (Render → **Restart Service**, ~30s) to force cache reload. Round 7 verified this on the actual deploy.
+
+### OAuth login gate: outside collaborators are NOT org members
+
+GitHub Apps restricted to "Only on this account" reject OAuth authorize requests for non-members with a bare 404. Outside collaborators (repo-level access only) count as non-members for OAuth. Two independent fixes needed to unblock dashboard login for outside collaborators:
+
+1. Change the App's install setting to "Any account" (org owner)
+2. Set `ALLOWED_GITHUB_ORGS=` empty on backend, OR add proper org members to the allowlist
+
+For a private PoC where the dashboard is only accessed by known users, gate #2 can be safely relaxed. Real production should re-enable it (or use `CONFIGURED_ADMINS=` login-based allowlist).
+
+### Verified in Round 7
+
+GitHub trigger validated end-to-end: `@openswe` comment on issue #5 → PR #6 opened in **95s** — same latency/cost shape as Round 6's Linear-triggered flow. Two trigger surfaces (Linear + GitHub) now known-good.
 
 ---
 
@@ -235,11 +300,15 @@ Then trigger a Linear issue with `@openswe`. PR should appear on `thunderbird/th
 | **Token encryption** | `TOKEN_ENCRYPTION_KEY` | ✅ | 44-char Fernet key (base64url with `=` padding) |
 | **LangSmith bypass** | `LANGCHAIN_TRACING_V2` | ✅ | `false` |
 | | `LANGSMITH_API_KEY_PROD` | ✅ | `stub-bot-mode-only-not-used` — **presence, not value**, activates bot-token-only auth mode (see `agent/utils/auth.py:70`) |
-| **Dashboard placeholders** | `DASHBOARD_JWT_SECRET` | ✅ | Any hex — required at boot even though dashboard UI is not deployed |
-| | `DASHBOARD_BASE_URL` | ✅ | `http://localhost:3000` (arbitrary — enables the boot validation path we bypass via `LLM_MODEL_ID`) |
-| | `DASHBOARD_API_BASE_URL` | ✅ | `http://localhost:2024` |
-| | `DASHBOARD_ALLOWED_ORIGINS` | ✅ | `http://localhost:3000` |
-| | `LANGGRAPH_URL` | ✅ | `http://localhost:2024` |
+| **Dashboard** | `DASHBOARD_JWT_SECRET` | ✅ | 64-char hex — signs session cookies. `openssl rand -hex 32` |
+| | `DASHBOARD_BASE_URL` | ✅ | `https://open-swe-poc-ui.onrender.com` — where the SPA is served |
+| | `DASHBOARD_API_BASE_URL` | ✅ | `https://open-swe-poc.onrender.com` — used to build OAuth `redirect_uri` |
+| | `DASHBOARD_ALLOWED_ORIGINS` | ✅ | Same as `DASHBOARD_BASE_URL`. Backend CORS is exact-origin only |
+| | `LANGGRAPH_URL` | ✅ | `http://localhost:2024` (or the backend URL — used server-side, loopback fine) |
+| **OAuth** (dashboard login) | `GITHUB_APP_CLIENT_ID` | ✅ | `Iv23liPKkL9jFVh8pdlN` — from GitHub App settings |
+| | `GITHUB_APP_CLIENT_SECRET` | ✅ | From GitHub App → Client secrets → Generate |
+| | `ALLOWED_GITHUB_ORGS` | ⚠️ | `thunderbird` for normal use. Set to empty during PoC eval by non-members. |
+| **UI Static Site env** (`open-swe-poc-ui`) | `VITE_DASHBOARD_API_BASE_URL` | ✅ | `https://open-swe-poc.onrender.com` — **NOT `VITE_API_URL`**. Compile-time; requires Manual Deploy after change |
 | **Run-complete webhook** (patch #8) | `RUN_COMPLETE_WEBHOOK_SECRET` | ✅ | 64-char hex — token LangGraph must present to `/webhooks/run-complete` |
 | | `COMPLETION_WEBHOOK_URL` | ✅ | `https://<render-url>/webhooks/run-complete` — must be absolute https, not loopback (LangGraph platform rejects loopback URLs) |
 

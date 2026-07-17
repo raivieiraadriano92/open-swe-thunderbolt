@@ -4,18 +4,13 @@ Companion checklist to [`THUNDERBOLT.md`](./THUNDERBOLT.md). Items are grouped b
 
 ## Immediate (can start now)
 
-- [ ] **Attach Render Persistent Disk to `/app/.langgraph_api` (persistence approach chosen)**
-  - No code change — pure Render config. Dashboard → `open-swe-poc` → **Disks** → **Add Disk**: name `langgraph-state`, mount path `/app/.langgraph_api`, size `1 GB`.
-  - Cost: $0.25/mo.
-  - Verify: trigger a small run → restart service via Render UI → confirm thread still visible.
-  - Persists: in-flight thread state, LangGraph Store (OAuth tokens, feedback, review-style profiles, thread message queues), ops queue, retry counter.
-  - Trade-off: pins us to single-instance scale. Acceptable — Thunderbolt's usage pattern (one team, one repo, sub-10 concurrent runs) is nowhere near that limit.
+- [x] **Attach Render Persistent Disk to `/app/.langgraph_api`** — done; verified in Round 7 (user-mapping seed survived restart and was read back).
 
-- [ ] **Document the LangGraph Platform licensing finding in the report**
-  - `langgraph-runtime-postgres` / `langgraph-runtime-community` are **not on public PyPI** — only `-inmem` is.
-  - `langgraph up` / `langgraph build` produce images that require `LANGGRAPH_CLOUD_LICENSE_KEY` for production (see `langgraph_cli/cli.py:298` + `langchain/langgraph-orchestrator-licensed` image reference).
-  - Real production options: (1) buy LangGraph Platform Self-Hosted license, (2) build a custom FastAPI wrapper using OSS `langgraph-checkpoint-postgres`, (3) use `langchain/langgraph-trial` free image, (4) stay on `langgraph dev` + persistent disk (what we chose).
-  - Material for stakeholders — adoption decision depends on this.
+- [x] **Document the LangGraph Platform licensing finding** — captured in `THUNDERBOLT.md` § *LangGraph Platform licensing*. Chose Option 1 (persistent disk); Options 2 / 4 flagged for real production.
+
+- [x] **Deploy dashboard UI (Render Static Site)** — live at `open-swe-poc-ui.onrender.com`. SPA rewrite rule + compile-time `VITE_DASHBOARD_API_BASE_URL` in place. Backend OAuth wiring correct (`redirect_uri` matches App callback).
+
+- [x] **Verify GitHub-trigger flow end-to-end** — Round 7: `@openswe` comment on issue #5 → PR #6 in 95s. Trigger surface count now 2 (Linear + GitHub).
 
 - [ ] **Run 1–2 varied tickets beyond README edits**
   - Current cost/latency data is entirely from trivial README-touching tasks.
@@ -25,16 +20,11 @@ Companion checklist to [`THUNDERBOLT.md`](./THUNDERBOLT.md). Items are grouped b
 
 ## Waiting on org owner
 
-- [ ] **Set `GITHUB_APP_CLIENT_SECRET` + verify dashboard login**
-  - Blocked on:
-    - Adding callback URL `https://open-swe-poc.onrender.com/dashboard/api/auth/callback` in the GitHub App settings.
-    - Generating a Client Secret in the App settings and handing it over.
-  - Once received: paste into Render env → save → verify OAuth roundtrip → screenshot logged-in dashboard.
+- [x] **`GITHUB_APP_CLIENT_SECRET` + callback URL set** — done. OAuth `redirect_uri` verified correct at `/dashboard/api/auth/login` (302 → GitHub OAuth authorize with the right params).
 
-- [ ] **Activate GitHub App webhook for `thunderbolt-sandbox`**
-  - Blocked on org owner enabling the webhook on the Thunderbolt Automation Agent App.
-  - URL: `https://open-swe-poc.onrender.com/webhooks/github` — secret matches `GITHUB_WEBHOOK_SECRET` on Render.
-  - Unlocks: triggering runs from GitHub issue comments (not just Linear).
+- [x] **GitHub App webhook activated** — done. Recent deliveries returning HTTP 200. `issue_comment` and `issues.opened` events routed correctly.
+
+- [ ] **Dashboard login for outside collaborators** — blocked. `raivieiraadriano92` is only an outside collaborator on 7 `thunderbird` repos, not an org member. GitHub App is restricted to "Only on this account" → OAuth returns 404 for non-members. Owner (Sancus) will add to org after billing changes settle. Alternative: flip App to "Any account" + set `ALLOWED_GITHUB_ORGS=` empty on backend.
 
 ## After login is live (unlocked by client secret)
 
