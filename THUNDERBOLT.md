@@ -4,21 +4,22 @@
 **Upstream base:** `langchain-ai/open-swe` @ `5cb2e2bb3582d69241b386bb0852c6f6b40b2dbb`
 **Deploy target:** [thunderbird/thunderbolt-sandbox](https://github.com/thunderbird/thunderbolt-sandbox)
 
-This fork evaluates [Open SWE](https://github.com/langchain-ai/open-swe) as a ticket-to-PR autonomous agent for Thunderbolt Factory, per THU-696. It runs on Render, is triggered by Linear `@openswe` mentions, and opens PRs against `thunderbird/thunderbolt-sandbox`. Seven local patches ride on top of upstream — none of which have been submitted back — that turn stock Open SWE from "unviably expensive" into "$0.24 per trivial task."
+This fork evaluates [Open SWE](https://github.com/langchain-ai/open-swe) as a ticket-to-PR autonomous agent for Thunderbolt Factory, per THU-696. It runs on Render, is triggered by Linear `@openswe` mentions, and opens PRs against `thunderbird/thunderbolt-sandbox`. Eight local patches ride on top of upstream — none of which have been submitted back — that turn stock Open SWE from "unviably expensive" into "$0.24 per trivial task."
 
 ---
 
-## Result — five test rounds
+## Result — six test rounds
 
-| # | Where | Model | Cache markers | Wall | Calls | Cost | Outcome |
-|---|---|---|---|---|---|---|---|
-| 1 | Local (personal fork target) | `anthropic/claude-sonnet-4.6` | ❌ | 13m 43s | 137 | **$20.00** | ✗ credit exhausted before push |
-| 2 | Local | `openai/gpt-5.6-sol` | ❌ | 1m 43s | 16 | $0.54 | ✗ push failed (no `gh` in sandbox) |
-| 3 | Local + git-auth patch | `openai/gpt-5.6-sol` | ❌ | 0m 33s | 11 | $0.26 | ✅ PR |
-| 4 | Local + all patches | `anthropic/claude-sonnet-4.6` | ✅ | 1m 29s | 17 | $0.17 | ✅ PR |
-| 5 | **Render (thunderbolt-sandbox target)** | `anthropic/claude-sonnet-4.6` | ✅ | **0m 56s** | ~15 | **$0.24** | ✅ **PR on production sandbox repo** |
+| # | Where | Model | Cache markers | Wall | Calls | Cost | Sandbox teardown | Outcome |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Local (personal fork target) | `anthropic/claude-sonnet-4.6` | ❌ | 13m 43s | 137 | **$20.00** | — | ✗ credit exhausted before push |
+| 2 | Local | `openai/gpt-5.6-sol` | ❌ | 1m 43s | 16 | $0.54 | — | ✗ push failed (no `gh` in sandbox) |
+| 3 | Local + git-auth patch | `openai/gpt-5.6-sol` | ❌ | 0m 33s | 11 | $0.26 | manual | ✅ PR |
+| 4 | Local + patches 1-7 | `anthropic/claude-sonnet-4.6` | ✅ | 1m 29s | 17 | $0.17 | manual | ✅ PR |
+| 5 | **Render (thunderbolt-sandbox target)** | `anthropic/claude-sonnet-4.6` | ✅ | 0m 56s | ~15 | $0.24 | idle-wait (~15m) | ✅ PR |
+| 6 | **Render + patch #8** | `anthropic/claude-sonnet-4.6` | ✅ | **1m 16s** | ~15 | **$0.23** | **auto (19s after PR)** | ✅ **PR on production sandbox repo** |
 
-**Headline:** Sonnet 4.6 + cache markers on Render = **117× cheaper** than the same model without markers.
+**Headline:** Sonnet 4.6 + cache markers on Render = **117× cheaper** than the same model without markers. Sandbox teardown patch cuts Daytona bill **~90% per task**.
 
 ---
 
@@ -48,7 +49,7 @@ GitHub App webhook ─┘ (deferred — needs org admin to activate on Thunderbo
 
 ---
 
-## The seven patches
+## The eight patches
 
 All in three files + one Makefile line + one Dockerfile. None require modifying Open SWE core beyond these.
 
@@ -103,6 +104,20 @@ Minimal Python 3.12 slim + `uv sync --frozen --no-dev` + `langgraph dev --no-bro
 `langgraph dev --no-reload` is used in prod because `langgraph up` requires docker-compose (docker-in-docker on Render doesn't work). Trade-off: in-memory checkpointer, no state persistence across container restarts. Acceptable for PoC.
 
 Commits: `poc(THU-696): Dockerfile for Render deploy` + `poc(THU-696): include README.md in Dockerfile deps layer (hatchling metadata)`
+
+### 8. Immediate Daytona sandbox teardown on run completion — `agent/completion.py`
+
+Adds `_cleanup_daytona_sandbox_for_thread()` and wires it into `handle_run_completion` so that when LangGraph's run-complete webhook fires (`success` / `error` / `timeout` — deliberately NOT `interrupted` since a successor run inherits the sandbox), we call `daytona.delete()` on the sandbox bound to the thread.
+
+Reuses the existing `/webhooks/run-complete` route + `verify_run_complete_token` machinery upstream shipped for failure-reply. Requires two env vars to be set — otherwise `dispatch.py` doesn't attach the webhook to runs:
+- `RUN_COMPLETE_WEBHOOK_SECRET` — shared secret proving the callback came from LangGraph
+- `COMPLETION_WEBHOOK_URL` — absolute https URL: `https://<render-url>/webhooks/run-complete`
+
+**Verified end-to-end:** sandbox destroyed **19s after PR opened** (round 6 test), vs the ~15 min idle wait that would fire from patch #4's `auto_stop_interval` alone. Effective Daytona bill cut by ~90% per task.
+
+Fire-and-forget: if the delete fails, teardown falls back to the `auto_stop_interval=15` safety net from patch #4. Never blocks the failure-reply logic.
+
+Commit: `poc(THU-696): destroy Daytona sandbox on run completion`
 
 ---
 
@@ -193,6 +208,8 @@ Then trigger a Linear issue with `@openswe`. PR should appear on `thunderbird/th
 | | `DASHBOARD_API_BASE_URL` | ✅ | `http://localhost:2024` |
 | | `DASHBOARD_ALLOWED_ORIGINS` | ✅ | `http://localhost:3000` |
 | | `LANGGRAPH_URL` | ✅ | `http://localhost:2024` |
+| **Run-complete webhook** (patch #8) | `RUN_COMPLETE_WEBHOOK_SECRET` | ✅ | 64-char hex — token LangGraph must present to `/webhooks/run-complete` |
+| | `COMPLETION_WEBHOOK_URL` | ✅ | `https://<render-url>/webhooks/run-complete` — must be absolute https, not loopback (LangGraph platform rejects loopback URLs) |
 
 ---
 
@@ -298,7 +315,8 @@ Rounds 1-5 all used the same "add a paragraph to README" task. Ticket asks for 3
 | `agent/utils/model.py` | Model routing + cache_control injection |
 | `agent/server.py` | Sandbox provisioning + git-auth patch |
 | `agent/integrations/daytona.py` | Daytona lifecycle (auto-stop + ephemeral) |
+| `agent/completion.py` | Run-complete webhook handler — sandbox teardown on success/error/timeout |
 | `agent/utils/linear_team_repo_map.py` | Linear team → target repo mapping |
 | `agent/utils/auth.py` | Bot-token-only mode logic (upstream, unchanged; behavior controlled by env) |
 
-Our 9 patch commits: `git log 5cb2e2bb..HEAD --oneline` shows the diff surface.
+Our 10 patch commits: `git log 5cb2e2bb..HEAD --oneline` shows the diff surface.
