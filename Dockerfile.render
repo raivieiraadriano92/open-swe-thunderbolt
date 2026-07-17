@@ -13,4 +13,9 @@ RUN uv sync --all-extras --frozen --no-dev
 COPY . .
 
 EXPOSE 2024
-CMD ["uv", "run", "langgraph", "dev", "--host", "0.0.0.0", "--port", "2024", "--no-browser", "--no-reload"]
+# THU-696 patch #9: switch from `langgraph dev` (pickle-file dev-mode) to
+# langgraph_api.cli with --runtime-edition postgres. This is the same server
+# `langgraph up` uses in docker-compose deployments, but invoked directly so
+# we can run in a single Render container. Reads DATABASE_URI + REDIS_URI
+# from env; the postgres edition hard-requires both.
+CMD ["uv", "run", "python", "-m", "langgraph_api.cli", "--host", "0.0.0.0", "--port", "2024", "--runtime-edition", "postgres", "--no-reload"]

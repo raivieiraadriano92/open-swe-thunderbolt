@@ -49,7 +49,7 @@ GitHub App webhook ─┘ (deferred — needs org admin to activate on Thunderbo
 
 ---
 
-## The eight patches
+## The nine patches
 
 All in three files + one Makefile line + one Dockerfile. None require modifying Open SWE core beyond these.
 
@@ -99,9 +99,7 @@ Commit: `poc(THU-696): skip auto-open of LangSmith Studio in dev`
 
 ### 7. Render Dockerfile — `Dockerfile.render`
 
-Minimal Python 3.12 slim + `uv sync --frozen --no-dev` + `langgraph dev --no-browser --no-reload` as the entrypoint. **Note:** README.md must be present in the deps layer because hatchling validates the readme file during metadata parsing, before dependency install.
-
-`langgraph dev --no-reload` is used in prod because `langgraph up` requires docker-compose (docker-in-docker on Render doesn't work). Trade-off: in-memory checkpointer, no state persistence across container restarts. Acceptable for PoC.
+Minimal Python 3.12 slim + `uv sync --frozen --no-dev`. Entrypoint changed by patch #9 (see below) to use `python -m langgraph_api.cli --runtime-edition postgres`. **Note:** README.md must be present in the deps layer because hatchling validates the readme file during metadata parsing, before dependency install.
 
 Commits: `poc(THU-696): Dockerfile for Render deploy` + `poc(THU-696): include README.md in Dockerfile deps layer (hatchling metadata)`
 
@@ -118,6 +116,22 @@ Reuses the existing `/webhooks/run-complete` route + `verify_run_complete_token`
 Fire-and-forget: if the delete fails, teardown falls back to the `auto_stop_interval=15` safety net from patch #4. Never blocks the failure-reply logic.
 
 Commit: `poc(THU-696): destroy Daytona sandbox on run completion`
+
+### 9. Postgres-backed persistence — `Dockerfile.render`
+
+Swaps the container entrypoint from `langgraph dev` (pickle-file dev-mode, wiped on every container restart) to `python -m langgraph_api.cli --runtime-edition postgres`. Same server binary `langgraph up` runs in its docker-compose orchestration, but invoked directly so it fits in a single Render container.
+
+Reads `DATABASE_URI` (Postgres) + `REDIS_URI` (Redis) from env. **Redis is required by the postgres runtime edition** — `langgraph_api/config/__init__.py:149` reads `REDIS_URI` with no default, so boot fails without it. Our own code doesn't use Redis; it's LangGraph platform infrastructure.
+
+What this unlocks:
+- **Checkpointer state persists** — in-flight threads survive container restarts, deploys, scale events.
+- **Store state persists** — LangGraph Store (per-user OAuth tokens, feedback events, per-repo review-style profiles, Slack/GitHub reaction event dedupe, thread-message queue) now durable.
+
+Free-tier resources on Render:
+- Postgres: 1 GB storage, free for 90 days then $6/mo Starter.
+- Key Value: 25 MB, free indefinitely (fine for our scale — Redis is only used for pub/sub, not data storage).
+
+Commit: `poc(THU-696): switch to postgres-backed langgraph runtime edition`
 
 ---
 
@@ -210,6 +224,8 @@ Then trigger a Linear issue with `@openswe`. PR should appear on `thunderbird/th
 | | `LANGGRAPH_URL` | ✅ | `http://localhost:2024` |
 | **Run-complete webhook** (patch #8) | `RUN_COMPLETE_WEBHOOK_SECRET` | ✅ | 64-char hex — token LangGraph must present to `/webhooks/run-complete` |
 | | `COMPLETION_WEBHOOK_URL` | ✅ | `https://<render-url>/webhooks/run-complete` — must be absolute https, not loopback (LangGraph platform rejects loopback URLs) |
+| **Persistence** (patch #9) | `DATABASE_URI` | ✅ | Render Postgres Internal URL — `postgres://…@dpg-…-a/…` |
+| | `REDIS_URI` | ✅ | Render Key Value Internal URL — `redis://red-…:6379`. Hard-required by LangGraph API's postgres runtime edition even though our app code doesn't use Redis. |
 
 ---
 
