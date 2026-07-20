@@ -10,6 +10,7 @@ import httpx
 from langchain_core.messages.content import create_text_block
 
 from ..utils.agent_comments import AGENT_COMMENT_MARKER
+from ..utils.linear import transition_issue_to_in_progress
 from . import common
 
 
@@ -253,3 +254,14 @@ async def process_linear_issue(  # noqa: PLR0912, PLR0915
         run.get("run_id") if isinstance(run, dict) else None,
     )
     await common.post_linear_trace_comment(issue_id, thread_id, triggering_comment_id)
+
+    # Move the ticket to the team's In Progress state so it reflects the
+    # work-in-progress status on Linear boards. Best-effort — a team with no
+    # "started" workflow state (or a transient Linear API failure) must not
+    # break the run.
+    team_id = (full_issue.get("team") or {}).get("id")
+    if isinstance(team_id, str) and team_id:
+        try:
+            await transition_issue_to_in_progress(issue_id, team_id)
+        except Exception:  # noqa: BLE001
+            common.logger.exception("Failed to transition Linear issue %s to In Progress", issue_id)

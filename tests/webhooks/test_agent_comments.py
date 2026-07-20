@@ -118,3 +118,83 @@ def test_post_github_issue_trace_comment_uses_on_it_body(monkeypatch: pytest.Mon
     assert captured["thread_id"] == "thread-1"
 
 
+def test_linear_transition_helper_looks_up_started_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Clear cache from any prior tests
+    linear_utils._IN_PROGRESS_STATE_CACHE.clear()
+
+    calls: list[tuple[str, dict[str, Any] | None]] = []
+
+    async def fake_graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls.append((query, variables))
+        if "workflowStates" in query:
+            return {
+                "workflowStates": {
+                    "nodes": [
+                        {"id": "state-backlog", "name": "Backlog"},
+                        {"id": "state-in-progress", "name": "In Progress"},
+                    ]
+                }
+            }
+        if "issueUpdate" in query:
+            return {"issueUpdate": {"success": True, "issue": {"id": variables["id"]}}}
+        return {}
+
+    monkeypatch.setattr(linear_utils, "_graphql_request", fake_graphql)
+
+    import asyncio
+
+    ok = asyncio.run(linear_utils.transition_issue_to_in_progress("issue-1", "team-1"))
+    assert ok is True
+
+    # Second call must hit the cache — no new workflowStates lookup.
+    calls_before = sum(1 for q, _ in calls if "workflowStates" in q)
+    asyncio.run(linear_utils.transition_issue_to_in_progress("issue-2", "team-1"))
+    calls_after = sum(1 for q, _ in calls if "workflowStates" in q)
+    assert calls_after == calls_before, "second call should use cached state id"
+
+
+def test_linear_transition_returns_false_when_no_started_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    linear_utils._IN_PROGRESS_STATE_CACHE.clear()
+
+    async def fake_graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:  # noqa: ARG001
+        return {"workflowStates": {"nodes": []}}
+
+    monkeypatch.setattr(linear_utils, "_graphql_request", fake_graphql)
+
+    import asyncio
+
+    ok = asyncio.run(linear_utils.transition_issue_to_in_progress("issue-1", "team-empty"))
+    assert ok is False
+
+
+def test_linear_transition_prefers_named_in_progress_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    linear_utils._IN_PROGRESS_STATE_CACHE.clear()
+    captured: dict[str, Any] = {}
+
+    async def fake_graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if "workflowStates" in query:
+            # Two "started" states; the second one is named "In Progress"
+            return {
+                "workflowStates": {
+                    "nodes": [
+                        {"id": "state-doing", "name": "Doing"},
+                        {"id": "state-in-progress", "name": "In Progress"},
+                    ]
+                }
+            }
+        if "issueUpdate" in query:
+            captured["input"] = variables["input"]
+            return {"issueUpdate": {"success": True, "issue": {"id": variables["id"]}}}
+        return {}
+
+    monkeypatch.setattr(linear_utils, "_graphql_request", fake_graphql)
+
+    import asyncio
+
+    ok = asyncio.run(linear_utils.transition_issue_to_in_progress("issue-1", "team-multi"))
+    assert ok is True
+    assert captured["input"]["stateId"] == "state-in-progress"

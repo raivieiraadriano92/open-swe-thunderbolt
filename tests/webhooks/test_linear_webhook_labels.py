@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -169,6 +170,68 @@ def test_linear_issue_create_with_openswe_label_dispatches(
     assert response.status_code == 200
     assert response.json()["status"] == "accepted"
     assert scheduled["issue"]["identifier"] == "OS-42"
+
+
+def test_linear_process_issue_transitions_to_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A label-triggered run should move the ticket to the team's In Progress state."""
+    from agent.utils import linear as linear_utils
+    from agent.webhooks import linear as linear_service
+
+    captured: dict[str, Any] = {}
+
+    async def fake_transition(issue_id: str, team_id: str) -> bool:
+        captured["issue_id"] = issue_id
+        captured["team_id"] = team_id
+        return True
+
+    # Stub the rest so process_linear_issue only exercises the transition.
+    async def fake_dispatch(*_a: Any, **_kw: Any) -> dict:
+        return {"run_id": "run-x"}
+
+    async def fake_upsert(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    async def fake_resolve(_email: str | None) -> str | None:
+        return None
+
+    async def fake_trace(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    async def fake_fetch(_id: str) -> dict:
+        return {
+            "id": "issue-1",
+            "identifier": "OS-42",
+            "title": "t",
+            "description": "d",
+            "url": "u",
+            "team": {"id": "team-1", "name": "Core"},
+            "labels": {"nodes": [{"name": "openswe"}]},
+            "creator": {"email": None, "name": None},
+            "comments": {"nodes": []},
+        }
+
+    monkeypatch.setattr(linear_service, "transition_issue_to_in_progress", fake_transition)
+    monkeypatch.setattr(linear_service.common, "dispatch_agent_run", fake_dispatch)
+    monkeypatch.setattr(linear_service.common, "upsert_agent_thread_owner_metadata", fake_upsert)
+    monkeypatch.setattr(linear_service.common, "resolve_login_from_email_async", fake_resolve)
+    monkeypatch.setattr(linear_service.common, "post_linear_trace_comment", fake_trace)
+    monkeypatch.setattr(linear_service.common, "fetch_linear_issue_details", fake_fetch)
+    monkeypatch.setattr(
+        linear_service.common,
+        "react_to_linear_comment",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(linear_utils, "_graphql_request", AsyncMock(return_value={"issue": None}))
+
+    issue_data = {"id": "issue-1"}
+    import asyncio
+
+    asyncio.run(linear_service.process_linear_issue(issue_data, {"owner": "acme", "name": "repo"}))
+
+    assert captured["issue_id"] == "issue-1"
+    assert captured["team_id"] == "team-1"
 
 
 def test_linear_non_comment_non_issue_events_still_ignored() -> None:

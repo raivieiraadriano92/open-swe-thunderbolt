@@ -87,6 +87,65 @@ async def post_linear_trace_comment(
     )
 
 
+# Cache: team_id -> in-progress workflow state id. Team workflows are
+# effectively static; caching for the process lifetime avoids one GraphQL round
+# trip per triggered run.
+_IN_PROGRESS_STATE_CACHE: dict[str, str] = {}
+
+
+async def get_team_in_progress_state_id(team_id: str) -> str | None:
+    """Return the workflow state id used for "In Progress" on ``team_id``.
+
+    Linear tags each state with a ``type`` (``triage`` / ``backlog`` /
+    ``unstarted`` / ``started`` / ``completed`` / ``canceled``). ``started``
+    corresponds to In-Progress states. When a team has multiple ``started``
+    states we prefer the one named "In Progress" for label fidelity, else the
+    first one Linear returns.
+    """
+    if not team_id:
+        return None
+    cached = _IN_PROGRESS_STATE_CACHE.get(team_id)
+    if cached:
+        return cached
+
+    query = """
+    query TeamStartedStates($teamId: String!) {
+        workflowStates(
+            filter: {team: {id: {eq: $teamId}}, type: {eq: "started"}}
+        ) {
+            nodes { id name }
+        }
+    }
+    """
+    result = await _graphql_request(query, {"teamId": team_id})
+    if "error" in result:
+        return None
+    nodes = ((result.get("workflowStates") or {}).get("nodes")) or []
+    if not nodes:
+        return None
+    preferred = next(
+        (n for n in nodes if (n.get("name") or "").strip().lower() == "in progress"),
+        None,
+    )
+    state_id = (preferred or nodes[0]).get("id")
+    if state_id:
+        _IN_PROGRESS_STATE_CACHE[team_id] = state_id
+    return state_id
+
+
+async def transition_issue_to_in_progress(issue_id: str, team_id: str) -> bool:
+    """Move a Linear issue to its team's In-Progress workflow state.
+
+    Best-effort: returns False if the team has no ``started`` state, if the
+    Linear API rejects the update, or if any transient error occurs.
+    """
+    state_id = await get_team_in_progress_state_id(team_id)
+    if not state_id:
+        return False
+    result = await update_issue(issue_id, state_id=state_id)
+    return bool(result.get("success"))
+
+
 async def list_teams() -> dict[str, Any]:
     """List all teams in the Linear workspace."""
     query = """
