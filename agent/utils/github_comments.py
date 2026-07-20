@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from .agent_comments import format_agent_comment
 from .github_token import GitHubAuthError
 from .http import DEFAULT_HTTP_TIMEOUT
 
@@ -28,6 +29,7 @@ __all__ = [
     "format_github_comment_body_for_prompt",
     "get_thread_id_from_branch",
     "post_github_comment",
+    "post_github_issue_trace_comment",
     "react_to_github_comment",
     "sanitize_github_comment_body",
     "verify_github_signature",
@@ -202,16 +204,23 @@ async def post_github_comment(
     body: str,
     *,
     token: str,
+    thread_id: str | None = None,
 ) -> bool:
-    """Post a comment to a GitHub issue or PR."""
+    """Post an agent-authored comment to a GitHub issue or PR.
+
+    The body is auto-prefixed with the agent marker so humans can distinguish
+    agent comments from human replies and our webhook handler can loop-detect
+    them. ``thread_id`` appends a trace link to the marker line.
+    """
     owner = repo_config.get("owner", "")
     repo = repo_config.get("name", "")
     url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
+    formatted_body = format_agent_comment(body, thread_id=thread_id)
     async with httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT) as client:
         try:
             response = await client.post(
                 url,
-                json={"body": body},
+                json={"body": formatted_body},
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Accept": "application/vnd.github+json",
@@ -222,6 +231,23 @@ async def post_github_comment(
         except httpx.HTTPError:
             logger.exception("Failed to post comment to GitHub issue/PR #%s", issue_number)
             return False
+
+
+async def post_github_issue_trace_comment(
+    repo_config: dict[str, str],
+    issue_number: int,
+    thread_id: str,
+    *,
+    token: str,
+) -> bool:
+    """Post the "On it!" start-of-work comment on a GitHub issue."""
+    return await post_github_comment(
+        repo_config,
+        issue_number,
+        "On it!",
+        token=token,
+        thread_id=thread_id,
+    )
 
 
 async def fetch_issue_comments(

@@ -116,9 +116,7 @@ def _mark_last_text_part(msg: dict) -> None:
     """
     content = msg.get("content")
     if isinstance(content, str):
-        msg["content"] = [
-            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
-        ]
+        msg["content"] = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]
         return
     if isinstance(content, list):
         for part in reversed(content):

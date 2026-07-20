@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 
 from ..review.findings import FindingInteraction, ReviewerPRMeta, ReviewerSlackThread
-from ..utils.github_comments import GitHubAuthError
+from ..utils.github_comments import GitHubAuthError, post_github_issue_trace_comment
 from ..utils.slack import GitHubPrRef
 from . import common
 
@@ -1014,3 +1014,20 @@ async def process_github_issue(payload: dict[str, Any], event_type: str) -> None
         client=langgraph_client,
     )
     common.logger.info("LangGraph run dispatched for thread %s from GitHub issue", thread_id)
+
+    # "On it!" comment mirrors the Linear path so the requester sees an
+    # acknowledgement on the issue itself, not just an emoji reaction. Best
+    # effort — a failure here must never break the run dispatch above.
+    if reaction_token and issue_number:
+        try:
+            await post_github_issue_trace_comment(
+                repo_config,
+                issue_number,
+                thread_id,
+                token=reaction_token,
+            )
+        except Exception:  # noqa: BLE001
+            common.logger.exception(
+                "Failed to post start-of-work comment on GitHub issue #%s",
+                issue_number,
+            )

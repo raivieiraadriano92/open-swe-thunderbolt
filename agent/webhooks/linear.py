@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 from langchain_core.messages.content import create_text_block
 
+from ..utils.agent_comments import AGENT_COMMENT_MARKER
 from . import common
 
 
@@ -75,6 +76,7 @@ async def process_linear_issue(  # noqa: PLR0912, PLR0915
     triggering_comment_id = issue_data.get("triggering_comment_id", "")
 
     bot_message_prefixes = (
+        AGENT_COMMENT_MARKER,
         "🔐 **GitHub Authentication Required**",
         "✅ **Pull Request Created**",
         "✅ **Pull Request Updated**",

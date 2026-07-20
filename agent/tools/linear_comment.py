@@ -1,5 +1,7 @@
 from typing import Any
 
+from langgraph.config import get_config
+
 from ..utils.linear import comment_on_linear_issue
 
 
@@ -21,5 +23,6 @@ async def linear_comment(comment_body: str, ticket_id: str) -> dict[str, Any]:
     Returns:
         Dictionary with 'success' (bool) key.
     """
-    success = await comment_on_linear_issue(ticket_id, comment_body)
+    thread_id = (get_config().get("configurable") or {}).get("thread_id")
+    success = await comment_on_linear_issue(ticket_id, comment_body, thread_id=thread_id)
     return {"success": success}

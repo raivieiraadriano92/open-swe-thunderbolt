@@ -8,8 +8,7 @@ from typing import Any
 
 import httpx
 
-from agent.utils.langsmith import get_langsmith_trace_url
-
+from .agent_comments import format_agent_comment
 from .http import DEFAULT_HTTP_TIMEOUT
 
 logger = logging.getLogger(__name__)
@@ -47,9 +46,19 @@ async def _graphql_request(query: str, variables: dict[str, Any] | None = None) 
 
 
 async def comment_on_linear_issue(
-    issue_id: str, comment_body: str, parent_id: str | None = None
+    issue_id: str,
+    comment_body: str,
+    parent_id: str | None = None,
+    *,
+    thread_id: str | None = None,
 ) -> bool:
-    """Add a comment to a Linear issue, optionally as a reply to a specific comment."""
+    """Post an agent-authored comment on a Linear issue.
+
+    Every outbound comment is prefixed with the standard agent marker (see
+    :mod:`agent.utils.agent_comments`) so humans can distinguish agent comments
+    from human replies and our own webhook handlers can loop-detect them.
+    ``thread_id`` is used to append a trace link to the marker line.
+    """
     mutation = """
     mutation CommentCreate($issueId: String!, $body: String!, $parentId: String) {
         commentCreate(input: { issueId: $issueId, body: $body, parentId: $parentId }) {
@@ -58,9 +67,10 @@ async def comment_on_linear_issue(
         }
     }
     """
+    formatted_body = format_agent_comment(comment_body, thread_id=thread_id)
     result = await _graphql_request(
         mutation,
-        {"issueId": issue_id, "body": comment_body, "parentId": parent_id},
+        {"issueId": issue_id, "body": formatted_body, "parentId": parent_id},
     )
     return bool(result.get("commentCreate", {}).get("success"))
 
@@ -68,20 +78,13 @@ async def comment_on_linear_issue(
 async def post_linear_trace_comment(
     issue_id: str, thread_id: str, triggering_comment_id: str
 ) -> None:
-    """Post a trace URL comment on a Linear issue."""
-    trace_url = get_langsmith_trace_url(thread_id)
-    if trace_url:
-        await comment_on_linear_issue(
-            issue_id,
-            f"On it! [View trace]({trace_url})",
-            parent_id=triggering_comment_id or None,
-        )
-    else:
-        await comment_on_linear_issue(
-            issue_id,
-            "On it!",
-            parent_id=triggering_comment_id or None,
-        )
+    """Post the "On it!" start-of-work comment on a Linear issue."""
+    await comment_on_linear_issue(
+        issue_id,
+        "On it!",
+        parent_id=triggering_comment_id or None,
+        thread_id=thread_id,
+    )
 
 
 async def list_teams() -> dict[str, Any]:

@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
+from ..utils.agent_comments import AGENT_COMMENT_MARKER
 from . import common
 from . import linear as service
 
@@ -152,6 +153,7 @@ async def linear_webhook(  # noqa: PLR0911, PLR0912, PLR0915
 
     comment_body = data.get("body", "")
     bot_message_prefixes = [
+        AGENT_COMMENT_MARKER,
         "🔐 **GitHub Authentication Required**",
         "✅ **Pull Request Created**",
         "✅ **Pull Request Updated**",
