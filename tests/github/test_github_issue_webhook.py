@@ -237,6 +237,132 @@ def test_github_webhook_ignores_issue_events_without_body_or_title_change(monkey
     assert called is False
 
 
+def test_github_webhook_accepts_issue_opened_with_openswe_label(monkeypatch) -> None:
+    called: dict[str, object] = {}
+
+    async def fake_process_github_issue(payload: dict[str, object], event_type: str) -> None:
+        called["payload"] = payload
+        called["event_type"] = event_type
+
+    monkeypatch.setattr(github_webhooks, "process_github_issue", fake_process_github_issue)
+    monkeypatch.setattr(webhook_common, "GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    client = TestClient(app)
+    response = _post_github_webhook(
+        client,
+        "issues",
+        {
+            "action": "opened",
+            "issue": {
+                "id": 12345,
+                "number": 42,
+                "title": "Fix the flaky test",
+                "body": "No mention here.",
+                "labels": [{"name": "OpenSWE"}],
+            },
+            "repository": {"owner": {"login": "langchain-ai"}, "name": "open-swe"},
+            "sender": {"login": "octocat"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert called["event_type"] == "issues"
+
+
+def test_github_webhook_accepts_labeled_action_with_openswe_label(monkeypatch) -> None:
+    called: dict[str, object] = {}
+
+    async def fake_process_github_issue(payload: dict[str, object], event_type: str) -> None:
+        called["payload"] = payload
+        called["event_type"] = event_type
+
+    monkeypatch.setattr(github_webhooks, "process_github_issue", fake_process_github_issue)
+    monkeypatch.setattr(webhook_common, "GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    client = TestClient(app)
+    response = _post_github_webhook(
+        client,
+        "issues",
+        {
+            "action": "labeled",
+            "label": {"name": "openswe"},
+            "issue": {
+                "id": 12345,
+                "number": 42,
+                "title": "Fix the flaky test",
+                "body": "No mention here.",
+                "labels": [{"name": "openswe"}, {"name": "bug"}],
+            },
+            "repository": {"owner": {"login": "langchain-ai"}, "name": "open-swe"},
+            "sender": {"login": "octocat"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert called["event_type"] == "issues"
+
+
+def test_github_webhook_ignores_labeled_action_with_unrelated_label(monkeypatch) -> None:
+    async def fake_process_github_issue(payload: dict[str, object], event_type: str) -> None:
+        raise AssertionError("process_github_issue should not be called")
+
+    monkeypatch.setattr(github_webhooks, "process_github_issue", fake_process_github_issue)
+    monkeypatch.setattr(webhook_common, "GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    client = TestClient(app)
+    response = _post_github_webhook(
+        client,
+        "issues",
+        {
+            "action": "labeled",
+            "label": {"name": "bug"},
+            "issue": {
+                "id": 12345,
+                "number": 42,
+                "title": "Fix the flaky test",
+                "body": "No mention here.",
+                "labels": [{"name": "bug"}],
+            },
+            "repository": {"owner": {"login": "langchain-ai"}, "name": "open-swe"},
+            "sender": {"login": "octocat"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
+
+
+def test_github_webhook_ignores_issue_opened_without_mention_or_label(monkeypatch) -> None:
+    async def fake_process_github_issue(payload: dict[str, object], event_type: str) -> None:
+        raise AssertionError("process_github_issue should not be called")
+
+    monkeypatch.setattr(github_webhooks, "process_github_issue", fake_process_github_issue)
+    monkeypatch.setattr(webhook_common, "GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+
+    client = TestClient(app)
+    response = _post_github_webhook(
+        client,
+        "issues",
+        {
+            "action": "opened",
+            "issue": {
+                "id": 12345,
+                "number": 42,
+                "title": "Fix the flaky test",
+                "body": "No mention here.",
+                "labels": [{"name": "bug"}],
+            },
+            "repository": {"owner": {"login": "langchain-ai"}, "name": "open-swe"},
+            "sender": {"login": "octocat"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
+
+
 def test_github_webhook_accepts_issue_comment_events(monkeypatch) -> None:
     called: dict[str, object] = {}
 

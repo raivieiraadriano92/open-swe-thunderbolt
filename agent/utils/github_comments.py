@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "GitHubAuthError",
+    "OPEN_SWE_LABEL",
     "OPEN_SWE_TAGS",
     "build_pr_prompt",
     "extract_pr_context",
@@ -33,6 +34,7 @@ __all__ = [
 ]
 
 OPEN_SWE_TAGS = ("@openswe", "@open-swe", "@openswe-dev")
+OPEN_SWE_LABEL = "openswe"
 UNTRUSTED_GITHUB_COMMENT_OPEN_TAG = "<dangerous-external-untrusted-users-comment>"
 UNTRUSTED_GITHUB_COMMENT_CLOSE_TAG = "</dangerous-external-untrusted-users-comment>"
 _SANITIZED_UNTRUSTED_GITHUB_COMMENT_OPEN_TAG = "[blocked-untrusted-comment-tag-open]"

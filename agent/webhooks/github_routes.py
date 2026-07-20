@@ -100,10 +100,37 @@ async def github_webhook(
                 common.logger.info("Ignoring GitHub issue edit without title/body changes")
                 return {"status": "ignored", "reason": "Issue edit did not change title or body"}
 
-        issue_text = f"{issue.get('title', '')}\n\n{issue.get('body', '')}".lower()
-        if not any(tag in issue_text for tag in common.OPEN_SWE_TAGS):
-            common.logger.info("Ignoring issue that does not mention @openswe or @open-swe")
-            return {"status": "ignored", "reason": "Issue does not mention @openswe or @open-swe"}
+        # `labeled` events only trigger when the label just added is our own.
+        # `opened`/`reopened`/`edited` trigger on either an @openswe mention or
+        # the label already being present on the issue.
+        if action == "labeled":
+            added_label = (payload.get("label") or {}).get("name", "")
+            if added_label.lower() != common.OPEN_SWE_LABEL:
+                common.logger.info(
+                    "Ignoring GitHub issue labeled event: added label '%s' is not '%s'",
+                    added_label,
+                    common.OPEN_SWE_LABEL,
+                )
+                return {
+                    "status": "ignored",
+                    "reason": f"Added label '{added_label}' is not '{common.OPEN_SWE_LABEL}'",
+                }
+        else:
+            issue_text = f"{issue.get('title', '')}\n\n{issue.get('body', '')}".lower()
+            has_mention = any(tag in issue_text for tag in common.OPEN_SWE_TAGS)
+            has_label = any(
+                (label.get("name", "") or "").lower() == common.OPEN_SWE_LABEL
+                for label in issue.get("labels", []) or []
+            )
+            if not (has_mention or has_label):
+                common.logger.info(
+                    "Ignoring issue that does not mention @openswe / @open-swe and has no '%s' label",
+                    common.OPEN_SWE_LABEL,
+                )
+                return {
+                    "status": "ignored",
+                    "reason": f"Issue has no @openswe mention and no '{common.OPEN_SWE_LABEL}' label",
+                }
 
         gate_rejection = await common._enforce_public_repo_org_gate(payload, event_type)
         if gate_rejection is not None:

@@ -65,6 +65,7 @@ from ..utils.github_app import (
 )
 from ..utils.github_checks import complete_review_check_run, create_review_check_run  # noqa: F401
 from ..utils.github_comments import (
+    OPEN_SWE_LABEL,
     OPEN_SWE_TAGS,
     build_pr_prompt,  # noqa: F401
     derive_pr_state,
@@ -134,6 +135,7 @@ __all__ = [
     "HTTPException",
     "LANGGRAPH_URL",
     "LINEAR_WEBHOOK_SECRET",
+    "OPEN_SWE_LABEL",
     "OPEN_SWE_TAGS",
     "REVIEWER_THREAD_KIND",
     "Request",
@@ -967,7 +969,7 @@ _SUPPORTED_GH_EVENTS = frozenset(
         "push",
     ]
 )
-_SUPPORTED_GH_ISSUE_ACTIONS = frozenset(["edited", "opened", "reopened"])
+_SUPPORTED_GH_ISSUE_ACTIONS = frozenset(["edited", "labeled", "opened", "reopened"])
 _SUPPORTED_GH_PULL_REQUEST_ACTIONS = frozenset(
     [
         "opened",
