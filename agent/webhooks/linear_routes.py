@@ -1,5 +1,6 @@
 """Linear webhook HTTP routes."""
 
+import time
 from typing import Any
 
 from fastapi import APIRouter
@@ -9,6 +10,33 @@ from . import common
 from . import linear as service
 
 router = APIRouter()
+
+# Process-lifetime dedup for Linear issue-label dispatches. Linear can fan the
+# same logical "user added the openswe label" out into an Issue.create + one or
+# more Issue.update webhooks that all pass ``_thread_exists`` before the first
+# background task actually creates the thread, causing duplicate dispatches
+# (each one posting another "On it!" comment and interrupting the last run).
+# Marking an issue as "recently dispatched" the moment we accept its event
+# closes the race for the whole webhook fan-out.
+_RECENT_DISPATCH_TTL_S = 30.0
+_recent_dispatches: dict[str, float] = {}
+
+
+def _reserve_dispatch_slot(issue_id: str) -> bool:
+    """Atomic mark-and-check: True on first call within the TTL, False after.
+
+    Prunes stale entries in the same pass. Correctness relies on the fact that
+    dict membership + assignment run within a single coroutine tick — no
+    ``await`` between them — so concurrent webhook handlers cannot both see
+    the slot as empty.
+    """
+    now = time.monotonic()
+    for key in [k for k, ts in _recent_dispatches.items() if now - ts > _RECENT_DISPATCH_TTL_S]:
+        _recent_dispatches.pop(key, None)
+    if issue_id in _recent_dispatches:
+        return False
+    _recent_dispatches[issue_id] = now
+    return True
 
 
 async def _resolve_repo_for_issue(
@@ -76,6 +104,16 @@ async def _handle_linear_issue_event(
         return {
             "status": "ignored",
             "reason": "A thread already exists for this issue",
+        }
+
+    # Race window: `_thread_exists` yields, so a fan-out of Issue.create +
+    # Issue.update for the same label add can both reach here before either
+    # background task creates the thread. Reserve the slot atomically to
+    # ensure only the first handler proceeds.
+    if not _reserve_dispatch_slot(issue_id):
+        return {
+            "status": "ignored",
+            "reason": "Concurrent dispatch already scheduled for this issue",
         }
 
     fallback_email = (full_issue.get("creator") or {}).get("email") or (

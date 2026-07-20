@@ -64,6 +64,14 @@ def _webhook_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(webhook_common, "LINEAR_WEBHOOK_SECRET", _SECRET)
 
 
+@pytest.fixture(autouse=True)
+def _clear_dedup_state() -> None:
+    """The dedup set is process-lifetime; wipe it between tests."""
+    from agent.webhooks import linear_routes
+
+    linear_routes._recent_dispatches.clear()
+
+
 def test_linear_issue_labeled_openswe_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
     scheduled: dict[str, Any] = {}
 
@@ -232,6 +240,42 @@ def test_linear_process_issue_transitions_to_in_progress(
 
     assert captured["issue_id"] == "issue-1"
     assert captured["team_id"] == "team-1"
+
+
+def test_linear_issue_label_dedup_blocks_concurrent_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two Issue events for the same label add must not both dispatch."""
+    from agent.webhooks import linear_routes
+
+    linear_routes._recent_dispatches.clear()
+
+    call_count = {"n": 0}
+
+    async def fake_process(_issue: dict, _repo: dict) -> None:
+        call_count["n"] += 1
+
+    async def fake_fetch(_id: str) -> dict:
+        return _full_issue_details(labels=["openswe"])
+
+    async def fake_default_repo() -> dict[str, str]:
+        return {"owner": "langchain-ai", "name": "open-swe"}
+
+    async def fake_thread_exists(_thread_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(linear_routes.service, "process_linear_issue", fake_process)
+    monkeypatch.setattr(webhook_common, "fetch_linear_issue_details", fake_fetch)
+    monkeypatch.setattr(webhook_common, "_thread_exists", fake_thread_exists)
+    monkeypatch.setattr(webhook_common, "get_team_default_repo", fake_default_repo)
+
+    client = TestClient(app)
+    r1 = _post_linear(client, _issue_payload(action="create", labels=["openswe"]))
+    r2 = _post_linear(client, _issue_payload(action="update", labels=["openswe"]))
+
+    assert r1.json()["status"] == "accepted"
+    assert r2.json()["status"] == "ignored"
+    assert "Concurrent dispatch" in r2.json()["reason"]
 
 
 def test_linear_non_comment_non_issue_events_still_ignored() -> None:
