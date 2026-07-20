@@ -108,8 +108,13 @@ async def get_team_in_progress_state_id(team_id: str) -> str | None:
     if cached:
         return cached
 
+    # Linear's WorkflowStateFilter typing expects `team.id` to be filtered as an
+    # `ID` (not a plain String) — an earlier String! declaration failed with
+    # "Variable of type String! used in position expecting type ID." and the
+    # error was swallowed by `_graphql_request`, silently disabling the
+    # transition. Keep as `ID!` here.
     query = """
-    query TeamStartedStates($teamId: String!) {
+    query TeamStartedStates($teamId: ID!) {
         workflowStates(
             filter: {team: {id: {eq: $teamId}}, type: {eq: "started"}}
         ) {
