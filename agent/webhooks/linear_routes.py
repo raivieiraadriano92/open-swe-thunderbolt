@@ -1,5 +1,7 @@
 """Linear webhook HTTP routes."""
 
+from typing import Any
+
 from fastapi import APIRouter
 
 from . import common
@@ -8,13 +10,110 @@ from . import linear as service
 router = APIRouter()
 
 
+async def _resolve_repo_for_issue(
+    full_issue: dict[str, Any],
+    fallback_email: str | None,
+) -> dict[str, str] | None:
+    """Repo resolution used by the Issue-event path (label triggers).
+
+    Mirrors the resolution ladder used for Comment triggers: dashboard default
+    for the triggering user → team/project mapping → team default.
+    """
+    if fallback_email:
+        try:
+            profile_repo = await common.get_profile_default_repo(
+                await common.resolve_login_from_email_async(fallback_email)
+            )
+            if profile_repo:
+                return profile_repo
+        except Exception:  # noqa: BLE001
+            common.logger.exception("Failed to apply dashboard default_repo for Linear user")
+
+    team = full_issue.get("team") or {}
+    team_name = (team.get("name") or "").strip()
+    project = full_issue.get("project") or {}
+    project_name = (project.get("name") or "").strip()
+
+    mapped = common.get_repo_config_from_team_mapping(team_name, project_name)
+    if mapped:
+        return mapped
+    return await common.get_team_default_repo()
+
+
+async def _handle_linear_issue_event(
+    payload: dict[str, Any],
+    background_tasks: common.BackgroundTasks,
+) -> dict[str, str]:
+    """Trigger a run when an issue gains the ``openswe`` label."""
+    action = payload.get("action")
+    if action not in ("create", "update"):
+        return {"status": "ignored", "reason": f"Issue action is '{action}', not create/update"}
+
+    data = payload.get("data") or {}
+    issue_id = data.get("id", "")
+    if not issue_id:
+        return {"status": "ignored", "reason": "No issue id in payload"}
+
+    full_issue = await common.fetch_linear_issue_details(issue_id)
+    if not full_issue:
+        common.logger.warning("Failed to fetch Linear issue %s for label check; ignoring", issue_id)
+        return {"status": "ignored", "reason": "Failed to fetch issue details"}
+
+    labels = ((full_issue.get("labels") or {}).get("nodes")) or []
+    has_label = any((label.get("name") or "").lower() == common.OPEN_SWE_LABEL for label in labels)
+    if not has_label:
+        return {
+            "status": "ignored",
+            "reason": f"Issue does not carry the '{common.OPEN_SWE_LABEL}' label",
+        }
+
+    # Idempotency: same thread id ⇒ we already dispatched on this issue.
+    # Re-adding the label doesn't re-fire; drop the label and re-add to trigger
+    # a fresh conversation on a new issue (or use @openswe in a comment).
+    thread_id = common.generate_thread_id_from_issue(issue_id)
+    if await common._thread_exists(thread_id):
+        return {
+            "status": "ignored",
+            "reason": "A thread already exists for this issue",
+        }
+
+    fallback_email = (full_issue.get("creator") or {}).get("email") or (
+        (full_issue.get("assignee") or {}).get("email")
+    )
+    repo_config = await _resolve_repo_for_issue(full_issue, fallback_email)
+    if not repo_config:
+        return {"status": "ignored", "reason": "No default repository configured"}
+    if not common._is_repo_allowed(repo_config):
+        common.logger.warning(
+            "Rejecting Linear webhook: repo '%s/%s' not in allowlist",
+            repo_config.get("owner"),
+            repo_config.get("name"),
+        )
+        return {"status": "ignored", "reason": "Repository not in allowlist"}
+
+    issue = dict(full_issue)
+    issue["id"] = issue_id
+    common.logger.info(
+        "Accepted Linear Issue label event for issue '%s' (%s), scheduling background task",
+        issue.get("title"),
+        issue_id,
+    )
+    background_tasks.add_task(service.process_linear_issue, issue, repo_config)
+    return {
+        "status": "accepted",
+        "message": f"Processing labeled issue '{issue.get('title')}' for repo "
+        f"{repo_config['owner']}/{repo_config['name']}",
+    }
+
+
 @router.post("/webhooks/linear")
 async def linear_webhook(  # noqa: PLR0911, PLR0912, PLR0915
     request: common.Request, background_tasks: common.BackgroundTasks
 ) -> dict[str, str]:
     """Handle Linear webhooks.
 
-    Triggers a new LangGraph run when an issue gets the 'open-swe' label added.
+    Triggers a new LangGraph run when either an ``@openswe`` comment is posted
+    on an issue, or the issue is labeled with ``openswe``.
     """
     common.logger.info("Received Linear webhook")
     body = await request.body()
@@ -30,9 +129,12 @@ async def linear_webhook(  # noqa: PLR0911, PLR0912, PLR0915
         common.logger.exception("Failed to parse webhook JSON")
         return {"status": "error", "message": "Invalid JSON"}
 
-    if payload.get("type") != "Comment":
-        common.logger.debug("Ignoring webhook: not a Comment event")
-        return {"status": "ignored", "reason": "Not a Comment event"}
+    event_type = payload.get("type")
+    if event_type == "Issue":
+        return await _handle_linear_issue_event(payload, background_tasks)
+    if event_type != "Comment":
+        common.logger.debug("Ignoring webhook: not a Comment or Issue event")
+        return {"status": "ignored", "reason": "Not a Comment or Issue event"}
 
     action = payload.get("action")
     if action != "create":

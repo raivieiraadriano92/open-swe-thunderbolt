@@ -432,6 +432,22 @@ async def fetch_linear_issue_details(issue_id: str) -> dict[str, Any] | None:
                 name
                 key
             }
+            labels {
+                nodes {
+                    id
+                    name
+                }
+            }
+            creator {
+                id
+                name
+                email
+            }
+            assignee {
+                id
+                name
+                email
+            }
             comments {
                 nodes {
                     id
