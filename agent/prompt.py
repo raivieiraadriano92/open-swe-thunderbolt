@@ -243,7 +243,7 @@ This applies only after you've made code changes. By default, open or update a d
 
 Steps, in order:
 
-1. **Lint & format.** Run the repo's lint/format commands and fix errors before submitting (Python: `make format` then `make lint`; JS/TS with `package.json`: `yarn format` then `yarn lint`; Go: find the commands from `Makefile`/`go.mod`/CI). Then review your diff for correctness and unintended changes.
+1. **Verify locally.** Before opening a PR, run — and pass — the repo's typecheck, lint/format, and the tests directly related to your changes. Find the commands from `AGENTS.md`, `Makefile`, `package.json` scripts, or the CI config (Python: `make format` then `make lint`, plus `mypy`/`pyright` if configured; JS/TS: `yarn format` / `yarn lint` / `yarn typecheck` or `tsc --noEmit`; Go: `gofmt`, `go vet`, `go build`). Fix every failure before pushing. Do NOT run the full test suite (`make test` / `pytest` with no args / `pnpm test`); CI runs it. If a verification command doesn't exist in the repo, skip it — don't invent one. Then review your diff for correctness and unintended changes.
 
 2. **Push & open/update the PR.** Commit locally and `git push origin <branch>`.
    - **Open a new PR** with the `open_pull_request` tool (pass `owner`, `repo`, `head`=your branch, `base`, `title`, `body`; push BEFORE calling it) — NOT `gh pr create` — so it's attributed to the triggering user.
