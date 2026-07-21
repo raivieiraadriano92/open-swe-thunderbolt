@@ -81,6 +81,23 @@ async def github_webhook(
         background_tasks.add_task(service.process_github_push_event, payload)
         return {"status": "accepted", "message": "Processing GitHub push for reviewer watch"}
 
+    if event_type in common._SUPPORTED_GH_CI_EVENTS:
+        # CI signals only produce auto-fix runs on PRs the agent opened
+        # (see _find_agent_thread_for_pr). Gate on the repo allowlist here so
+        # a webhook for a non-allowed repo never even reaches the handler.
+        if not common._is_repo_allowed(webhook_repo_config):
+            common.logger.debug(
+                "Rejecting GitHub CI webhook: repo '%s/%s' not in allowlist",
+                webhook_repo_config.get("owner"),
+                webhook_repo_config.get("name"),
+            )
+            return {"status": "ignored", "reason": "Repository not in allowlist"}
+        common.logger.info(
+            "Accepted GitHub %s webhook, scheduling CI auto-fix evaluation", event_type
+        )
+        background_tasks.add_task(service.process_github_ci_failure, payload, event_type)
+        return {"status": "accepted", "message": f"Processing GitHub {event_type} for CI auto-fix"}
+
     if not common._is_repo_allowed(webhook_repo_config):
         common.logger.debug(
             "Rejecting GitHub webhook: repo '%s/%s' not in allowlist",

@@ -977,14 +977,22 @@ def verify_linear_signature(body: bytes, signature: str, secret: str) -> bool:
 
 _SUPPORTED_GH_EVENTS = frozenset(
     [
+        "check_run",
+        "check_suite",
         "issue_comment",
         "issues",
         "pull_request",
         "pull_request_review_comment",
         "pull_request_review",
         "push",
+        "status",
+        "workflow_run",
     ]
 )
+# CI events that trigger the auto-fix dispatcher when they land on a PR the
+# agent opened. Kept separate so we can add/remove signals without touching the
+# main allowlist.
+_SUPPORTED_GH_CI_EVENTS = frozenset(["check_run", "check_suite", "status", "workflow_run"])
 _SUPPORTED_GH_ISSUE_ACTIONS = frozenset(["edited", "labeled", "opened", "reopened"])
 _SUPPORTED_GH_PULL_REQUEST_ACTIONS = frozenset(
     [

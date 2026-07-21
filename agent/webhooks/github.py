@@ -4,13 +4,49 @@ Helpers and constants stay in common.py; they are accessed through the module
 object (``common.X``) so tests that monkeypatch them keep working.
 """
 
+import time
 import uuid
 from typing import Any
 
+from ..dashboard.autofix_state import is_pr_autofix_disabled
 from ..review.findings import FindingInteraction, ReviewerPRMeta, ReviewerSlackThread
+from ..utils.github_ci import (
+    branch_from_check_payload,
+    fetch_open_pr_for_branch,
+    head_sha_from_check_payload,
+    is_failing_ci_payload,
+    list_failing_check_runs,
+    list_failing_statuses,
+    names_failing_on_base,
+)
 from ..utils.github_comments import GitHubAuthError, post_github_issue_trace_comment
 from ..utils.slack import GitHubPrRef
 from . import common
+
+# Process-lifetime dedup for CI auto-fix. A single failing CI run typically
+# fans out into several webhook events (per-check-run, aggregated check-suite,
+# workflow-run, sometimes a legacy status). We only want to dispatch one
+# auto-fix run per (PR, head_sha) — repeated events on the same commit must
+# be no-ops. Keyed on ``owner/repo#pr@sha``; TTL is process-lifetime because a
+# new commit produces a new sha (which naturally supersedes the entry).
+_RECENT_CI_AUTOFIX_TTL_S = 30 * 60.0  # 30 minutes is far longer than any CI run
+_recent_ci_autofix: dict[str, float] = {}
+
+
+def _reserve_ci_autofix_slot(owner: str, repo: str, pr_number: int, head_sha: str) -> bool:
+    """Atomic mark-and-check for CI auto-fix dedup. Correctness relies on the
+    dict membership + assignment happening in a single coroutine tick — no
+    ``await`` between them — so concurrent handlers can't both see the slot as
+    empty.
+    """
+    key = f"{owner.lower()}/{repo.lower()}#{pr_number}@{head_sha}"
+    now = time.monotonic()
+    for stale in [k for k, ts in _recent_ci_autofix.items() if now - ts > _RECENT_CI_AUTOFIX_TTL_S]:
+        _recent_ci_autofix.pop(stale, None)
+    if key in _recent_ci_autofix:
+        return False
+    _recent_ci_autofix[key] = now
+    return True
 
 
 def build_github_issue_prompt(
@@ -1031,3 +1067,233 @@ async def process_github_issue(payload: dict[str, Any], event_type: str) -> None
                 "Failed to post start-of-work comment on GitHub issue #%s",
                 issue_number,
             )
+
+
+async def _find_agent_thread_for_pr(pr_url: str) -> dict[str, Any] | None:
+    """Find the agent thread that opened ``pr_url``, if any.
+
+    ``open_pull_request`` stamps ``pr_url`` on the opener thread's metadata.
+    Reviewer threads are stamped separately; we skip them so we resume the
+    thread that authored the PR (whose history/plan/context is what an
+    auto-fix run needs).
+    """
+    langgraph_client = common.get_client(url=common.LANGGRAPH_URL)
+    try:
+        threads = await langgraph_client.threads.search(metadata={"pr_url": pr_url}, limit=10)
+    except Exception:  # noqa: BLE001
+        common.logger.debug("Thread search by pr_url=%s failed", pr_url, exc_info=True)
+        return None
+    for thread in threads or []:
+        metadata = thread.get("metadata") if isinstance(thread, dict) else None
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("kind") == common.REVIEWER_THREAD_KIND:
+            continue
+        return thread
+    return None
+
+
+def _build_ci_autofix_prompt(
+    *, pr_number: int, head_sha: str, failing: list[dict[str, Any]]
+) -> str:
+    """Assemble the user prompt for a CI auto-fix continuation run."""
+    lines = [
+        f"CI is failing on PR #{pr_number} at commit `{head_sha}`.",
+        "",
+        "Failing checks:",
+    ]
+    for check in failing:
+        name = check.get("name") or "unnamed"
+        conclusion = check.get("conclusion") or "failure"
+        details_url = check.get("details_url") or ""
+        suffix = f" — {details_url}" if details_url else ""
+        lines.append(f"- **{name}** ({conclusion}){suffix}")
+    lines.extend(
+        [
+            "",
+            "Fetch the failing logs (`GH_TOKEN=dummy gh run view --log-failed`, "
+            "`gh api`, or the details URL), diagnose the root cause, and fix it "
+            "locally. Then commit and push to the same branch — do not open a new "
+            "PR. Reuse the existing PR's branch and add the fix as a new commit.",
+            "",
+            "If the failure is unrelated to your change (already red on the base "
+            "branch, flaky infrastructure, or a third-party outage), comment on the "
+            "PR explaining that and stop — do not attempt a speculative fix.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def process_github_ci_failure(  # noqa: PLR0911, PLR0912, PLR0915
+    payload: dict[str, Any], event_type: str
+) -> None:
+    """Dispatch an auto-fix run when CI fails on a PR the agent opened.
+
+    Fires only when the CI event is a completed failure, the head branch has an
+    open PR that the agent opened (``pr_url`` metadata on an agent thread),
+    the PR hasn't been silenced via ``@openswe autofix off``, and the failing
+    checks aren't already red on the base branch.
+    """
+    if not is_failing_ci_payload(payload, event_type):
+        common.logger.debug("CI event %s not a completed failure; ignoring", event_type)
+        return
+
+    repo = payload.get("repository", {}) or {}
+    repo_config = {
+        "owner": (repo.get("owner") or {}).get("login", "")
+        or (repo.get("owner") or {}).get("name", ""),
+        "name": repo.get("name", ""),
+    }
+    if not repo_config["owner"] or not repo_config["name"]:
+        common.logger.warning("CI event %s missing repo owner/name; ignoring", event_type)
+        return
+    repo_private = common._repo_private_from_payload(payload)
+    repo_id = common._repo_id_from_payload(payload)
+
+    head_sha = head_sha_from_check_payload(payload, event_type)
+    branch = branch_from_check_payload(payload, event_type)
+    if not head_sha or not branch:
+        common.logger.debug(
+            "CI event %s missing head_sha=%s / branch=%s; ignoring", event_type, head_sha, branch
+        )
+        return
+
+    app_token, _ = await common._reviewer_token_for_repo(
+        repo_config,
+        repo_private=repo_private,
+        repo_id=repo_id,
+    )
+    if not app_token:
+        common.logger.warning(
+            "No GitHub App token for CI auto-fix on %s/%s@%s",
+            repo_config["owner"],
+            repo_config["name"],
+            head_sha,
+        )
+        return
+
+    pr = await fetch_open_pr_for_branch(
+        owner=repo_config["owner"], repo=repo_config["name"], branch=branch, token=app_token
+    )
+    if not pr:
+        common.logger.debug(
+            "CI event %s on %s/%s branch=%s: no open PR",
+            event_type,
+            repo_config["owner"],
+            repo_config["name"],
+            branch,
+        )
+        return
+
+    pr_number = pr.get("number")
+    pr_url = pr.get("html_url") or pr.get("url") or ""
+    if not isinstance(pr_number, int) or not pr_url:
+        common.logger.warning("CI event %s: PR metadata missing number/url", event_type)
+        return
+
+    if await is_pr_autofix_disabled(repo_config["owner"], repo_config["name"], pr_number):
+        common.logger.info(
+            "CI auto-fix skipped for %s/%s#%s: disabled via @openswe autofix off",
+            repo_config["owner"],
+            repo_config["name"],
+            pr_number,
+        )
+        return
+
+    # Cursor-style rule: don't try to fix failures that are already red on the
+    # base branch — they aren't introduced by this PR.
+    base_sha = (pr.get("base") or {}).get("sha", "")
+    checks = await list_failing_check_runs(
+        owner=repo_config["owner"], repo=repo_config["name"], ref=head_sha, token=app_token
+    )
+    statuses = await list_failing_statuses(
+        owner=repo_config["owner"], repo=repo_config["name"], ref=head_sha, token=app_token
+    )
+    all_failing = (checks or []) + (statuses or [])
+    if not all_failing:
+        common.logger.debug(
+            "CI event %s: no failing checks/statuses on %s/%s@%s (webhook may be stale)",
+            event_type,
+            repo_config["owner"],
+            repo_config["name"],
+            head_sha,
+        )
+        return
+
+    base_failing = await names_failing_on_base(
+        owner=repo_config["owner"],
+        repo=repo_config["name"],
+        base_sha=base_sha,
+        token=app_token,
+    )
+    novel = [c for c in all_failing if c.get("name") not in base_failing]
+    if not novel:
+        common.logger.info(
+            "CI auto-fix skipped for %s/%s#%s@%s: all failing checks already red on base",
+            repo_config["owner"],
+            repo_config["name"],
+            pr_number,
+            head_sha,
+        )
+        return
+
+    # Multiple webhook events land per commit (per-check-run, check-suite,
+    # workflow-run). Reserve the slot atomically so only the first one dispatches.
+    if not _reserve_ci_autofix_slot(repo_config["owner"], repo_config["name"], pr_number, head_sha):
+        common.logger.info(
+            "CI auto-fix already scheduled for %s/%s#%s@%s; ignoring duplicate event",
+            repo_config["owner"],
+            repo_config["name"],
+            pr_number,
+            head_sha,
+        )
+        return
+
+    agent_thread = await _find_agent_thread_for_pr(pr_url)
+    if agent_thread is None:
+        common.logger.info(
+            "CI auto-fix skipped for %s/%s#%s: no agent thread found (PR not opened by us)",
+            repo_config["owner"],
+            repo_config["name"],
+            pr_number,
+        )
+        return
+
+    thread_id = agent_thread.get("thread_id") or agent_thread.get("id")
+    if not isinstance(thread_id, str) or not thread_id:
+        common.logger.warning("CI auto-fix: agent thread for %s missing thread_id", pr_url)
+        return
+
+    metadata = agent_thread.get("metadata") if isinstance(agent_thread, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    configurable: dict[str, Any] = {
+        "repo": repo_config,
+        "source": "github_ci",
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "ci_head_sha": head_sha,
+    }
+    # Preserve identity so the auto-fix commit is attributed to the original
+    # requester and the resolved model/effort match the initial run.
+    for key in ("github_login", "user_email", "agent_model_id", "agent_effort"):
+        if metadata.get(key):
+            configurable[key] = metadata[key]
+
+    prompt = _build_ci_autofix_prompt(pr_number=pr_number, head_sha=head_sha, failing=novel)
+    common.logger.info(
+        "Dispatching CI auto-fix run for %s/%s#%s@%s (thread=%s, %d failing check(s))",
+        repo_config["owner"],
+        repo_config["name"],
+        pr_number,
+        head_sha,
+        thread_id,
+        len(novel),
+    )
+    await common.dispatch_agent_run(
+        thread_id,
+        prompt,
+        configurable,
+        source="github_ci",
+        metadata=common._AGENT_VERSION_METADATA,
+    )
