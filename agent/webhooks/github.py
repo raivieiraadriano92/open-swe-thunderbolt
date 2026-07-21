@@ -8,20 +8,33 @@ import time
 import uuid
 from typing import Any
 
-from ..dashboard.autofix_state import is_pr_autofix_disabled
+from ..dashboard.autofix_state import is_pr_autofix_disabled, set_pr_autofix_disabled
 from ..review.findings import FindingInteraction, ReviewerPRMeta, ReviewerSlackThread
 from ..utils.github_ci import (
     branch_from_check_payload,
     fetch_open_pr_for_branch,
     head_sha_from_check_payload,
-    is_failing_ci_payload,
     list_failing_check_runs,
     list_failing_statuses,
     names_failing_on_base,
 )
-from ..utils.github_comments import GitHubAuthError, post_github_issue_trace_comment
+from ..utils.github_comments import (
+    GitHubAuthError,
+    post_github_comment,
+    post_github_issue_trace_comment,
+)
 from ..utils.slack import GitHubPrRef
 from . import common
+
+# Bound the number of auto-fix attempts per PR failure streak. Prevents the
+# agent from spinning on failures it can't fix (e.g. an infrastructure bug or
+# a third-party outage the agent keeps mistaking for a code issue).
+CI_AUTOFIX_MAX_ATTEMPTS = 3
+
+# Thread metadata key storing the current attempt count. Resets to 0 when CI
+# on the PR goes fully green, so a later push that breaks CI gets a fresh
+# budget rather than dead-on-arrival auto-fix.
+_CI_AUTOFIX_ATTEMPTS_META_KEY = "ci_autofix_attempts"
 
 # Process-lifetime dedup for CI auto-fix. A single failing CI run typically
 # fans out into several webhook events (per-check-run, aggregated check-suite,
@@ -1094,11 +1107,22 @@ async def _find_agent_thread_for_pr(pr_url: str) -> dict[str, Any] | None:
 
 
 def _build_ci_autofix_prompt(
-    *, pr_number: int, head_sha: str, failing: list[dict[str, Any]]
+    *,
+    pr_number: int,
+    head_sha: str,
+    failing: list[dict[str, Any]],
+    attempt: int,
+    max_attempts: int,
 ) -> str:
-    """Assemble the user prompt for a CI auto-fix continuation run."""
+    """Assemble the user prompt for a CI auto-fix continuation run.
+
+    ``attempt``/``max_attempts`` are included so the agent knows how much
+    budget is left. On the final attempt the prompt biases toward "explain
+    and stop" over "speculative fix".
+    """
     lines = [
         f"CI is failing on PR #{pr_number} at commit `{head_sha}`.",
+        f"Auto-fix attempt {attempt} of {max_attempts}.",
         "",
         "Failing checks:",
     ]
@@ -1121,21 +1145,126 @@ def _build_ci_autofix_prompt(
             "PR explaining that and stop — do not attempt a speculative fix.",
         ]
     )
+    if attempt >= max_attempts:
+        lines.extend(
+            [
+                "",
+                "**This is your final auto-fix attempt.** After this run, no more "
+                "automatic retries will fire. If you are not confident the fix "
+                "will resolve CI, comment on the PR explaining what you've tried "
+                "and what a human should investigate — then stop.",
+            ]
+        )
     return "\n".join(lines)
+
+
+def _get_ci_autofix_attempts(agent_thread: dict[str, Any]) -> int:
+    """Read the current attempt count from an agent thread's metadata."""
+    metadata = agent_thread.get("metadata") if isinstance(agent_thread, dict) else None
+    if not isinstance(metadata, dict):
+        return 0
+    val = metadata.get(_CI_AUTOFIX_ATTEMPTS_META_KEY, 0)
+    return val if isinstance(val, int) and val >= 0 else 0
+
+
+async def _set_ci_autofix_attempts(thread_id: str, attempts: int) -> None:
+    """Persist a new attempt count on the agent thread. Best-effort."""
+    langgraph_client = common.get_client(url=common.LANGGRAPH_URL)
+    try:
+        await langgraph_client.threads.update(
+            thread_id=thread_id,
+            metadata={_CI_AUTOFIX_ATTEMPTS_META_KEY: attempts},
+        )
+    except Exception:  # noqa: BLE001
+        common.logger.debug(
+            "Failed to update %s for thread %s",
+            _CI_AUTOFIX_ATTEMPTS_META_KEY,
+            thread_id,
+            exc_info=True,
+        )
+
+
+def _is_completed_ci_payload(payload: dict[str, Any], event_type: str) -> bool:
+    """Return whether a CI event is 'completed' (success, failure, or otherwise).
+
+    We use this to distinguish a completion signal (which reset-on-green must
+    react to) from an in-progress signal (which we ignore entirely).
+    """
+    if event_type in {"check_run", "check_suite", "workflow_run"}:
+        node = payload.get(event_type) or {}
+        return node.get("status") == "completed"
+    if event_type == "status":
+        return payload.get("state") in {"success", "failure", "error"}
+    return False
+
+
+async def _escalate_ci_autofix(
+    *,
+    repo_config: dict[str, str],
+    pr_number: int,
+    thread_id: str,
+    github_login: str,
+    app_token: str,
+) -> None:
+    """Post an escalation comment and disable auto-fix for the PR.
+
+    Called after ``CI_AUTOFIX_MAX_ATTEMPTS`` have been dispatched without a
+    green result. The per-PR disable flag is the same escape hatch that
+    ``@openswe autofix off`` uses, so a human can flip it back on manually
+    (or with ``@openswe autofix on``) once they've investigated.
+    """
+    cc = f"\n\ncc @{github_login}" if github_login else ""
+    body = (
+        f"CI has failed on this PR after {CI_AUTOFIX_MAX_ATTEMPTS} automatic fix "
+        f"attempts. Auto-fix is now paused for this PR — no further retries will "
+        f"fire until a human intervenes.\n\n"
+        f"To re-enable, comment `@openswe autofix on` on this PR, or leave a new "
+        f"`@openswe <instructions>` comment with guidance.{cc}"
+    )
+    try:
+        await post_github_comment(
+            repo_config,
+            pr_number,
+            body,
+            token=app_token,
+            thread_id=thread_id,
+        )
+    except Exception:  # noqa: BLE001
+        common.logger.exception(
+            "Failed to post CI escalation comment on %s/%s#%s",
+            repo_config.get("owner"),
+            repo_config.get("name"),
+            pr_number,
+        )
+    try:
+        await set_pr_autofix_disabled(repo_config["owner"], repo_config["name"], pr_number, True)
+    except Exception:  # noqa: BLE001
+        common.logger.exception(
+            "Failed to disable auto-fix for %s/%s#%s",
+            repo_config.get("owner"),
+            repo_config.get("name"),
+            pr_number,
+        )
 
 
 async def process_github_ci_failure(  # noqa: PLR0911, PLR0912, PLR0915
     payload: dict[str, Any], event_type: str
 ) -> None:
-    """Dispatch an auto-fix run when CI fails on a PR the agent opened.
+    """React to CI completions on PRs the agent opened.
 
-    Fires only when the CI event is a completed failure, the head branch has an
-    open PR that the agent opened (``pr_url`` metadata on an agent thread),
-    the PR hasn't been silenced via ``@openswe autofix off``, and the failing
-    checks aren't already red on the base branch.
+    Handles two shapes:
+
+    * **Green completions** — if the head SHA is entirely passing, reset the
+      auto-fix attempt counter so a later failure gets a fresh budget.
+    * **Failures** — dispatch an auto-fix continuation run (with per-PR
+      opt-out, base-inherited filter, dedup) up to ``CI_AUTOFIX_MAX_ATTEMPTS``
+      times. Beyond that, post an escalation comment and disable auto-fix
+      until a human re-enables it.
+
+    In-progress signals are ignored (this fires only on ``completed`` events).
     """
-    if not is_failing_ci_payload(payload, event_type):
-        common.logger.debug("CI event %s not a completed failure; ignoring", event_type)
+    if not _is_completed_ci_payload(payload, event_type):
+        common.logger.debug("CI event %s not completed; ignoring", event_type)
         return
 
     repo = payload.get("repository", {}) or {}
@@ -1191,6 +1320,50 @@ async def process_github_ci_failure(  # noqa: PLR0911, PLR0912, PLR0915
         common.logger.warning("CI event %s: PR metadata missing number/url", event_type)
         return
 
+    # Resolve the agent thread first — no agent thread means we didn't open
+    # this PR, so neither reset-on-green nor auto-fix applies here.
+    agent_thread = await _find_agent_thread_for_pr(pr_url)
+    if agent_thread is None:
+        common.logger.debug(
+            "CI event %s on %s/%s#%s: no agent thread (PR not opened by us)",
+            event_type,
+            repo_config["owner"],
+            repo_config["name"],
+            pr_number,
+        )
+        return
+
+    thread_id = agent_thread.get("thread_id") or agent_thread.get("id")
+    if not isinstance(thread_id, str) or not thread_id:
+        common.logger.warning("CI event: agent thread for %s missing thread_id", pr_url)
+        return
+
+    # Fetch current failing state for the head SHA. GitHub always reports the
+    # latest per-check state, so repeated events for the same commit converge
+    # to the same list.
+    checks = await list_failing_check_runs(
+        owner=repo_config["owner"], repo=repo_config["name"], ref=head_sha, token=app_token
+    )
+    statuses = await list_failing_statuses(
+        owner=repo_config["owner"], repo=repo_config["name"], ref=head_sha, token=app_token
+    )
+    all_failing = (checks or []) + (statuses or [])
+
+    # Reset-on-green: this commit is fully passing, so any prior failure streak
+    # is over. Zero out the attempt counter so a future push that breaks CI
+    # gets a fresh budget rather than dead-on-arrival auto-fix.
+    if not all_failing:
+        if _get_ci_autofix_attempts(agent_thread) > 0:
+            common.logger.info(
+                "Resetting CI auto-fix attempt counter for %s/%s#%s (CI green on %s)",
+                repo_config["owner"],
+                repo_config["name"],
+                pr_number,
+                head_sha,
+            )
+            await _set_ci_autofix_attempts(thread_id, 0)
+        return
+
     if await is_pr_autofix_disabled(repo_config["owner"], repo_config["name"], pr_number):
         common.logger.info(
             "CI auto-fix skipped for %s/%s#%s: disabled via @openswe autofix off",
@@ -1203,23 +1376,6 @@ async def process_github_ci_failure(  # noqa: PLR0911, PLR0912, PLR0915
     # Cursor-style rule: don't try to fix failures that are already red on the
     # base branch — they aren't introduced by this PR.
     base_sha = (pr.get("base") or {}).get("sha", "")
-    checks = await list_failing_check_runs(
-        owner=repo_config["owner"], repo=repo_config["name"], ref=head_sha, token=app_token
-    )
-    statuses = await list_failing_statuses(
-        owner=repo_config["owner"], repo=repo_config["name"], ref=head_sha, token=app_token
-    )
-    all_failing = (checks or []) + (statuses or [])
-    if not all_failing:
-        common.logger.debug(
-            "CI event %s: no failing checks/statuses on %s/%s@%s (webhook may be stale)",
-            event_type,
-            repo_config["owner"],
-            repo_config["name"],
-            head_sha,
-        )
-        return
-
     base_failing = await names_failing_on_base(
         owner=repo_config["owner"],
         repo=repo_config["name"],
@@ -1249,24 +1405,33 @@ async def process_github_ci_failure(  # noqa: PLR0911, PLR0912, PLR0915
         )
         return
 
-    agent_thread = await _find_agent_thread_for_pr(pr_url)
-    if agent_thread is None:
-        common.logger.info(
-            "CI auto-fix skipped for %s/%s#%s: no agent thread found (PR not opened by us)",
-            repo_config["owner"],
-            repo_config["name"],
-            pr_number,
-        )
-        return
-
-    thread_id = agent_thread.get("thread_id") or agent_thread.get("id")
-    if not isinstance(thread_id, str) or not thread_id:
-        common.logger.warning("CI auto-fix: agent thread for %s missing thread_id", pr_url)
-        return
-
+    # Attempt gate: if we've hit the max, escalate to human review and stop.
+    attempts = _get_ci_autofix_attempts(agent_thread)
     metadata = agent_thread.get("metadata") if isinstance(agent_thread, dict) else {}
     if not isinstance(metadata, dict):
         metadata = {}
+    github_login = (
+        metadata.get("github_login") if isinstance(metadata.get("github_login"), str) else ""
+    )
+
+    if attempts >= CI_AUTOFIX_MAX_ATTEMPTS:
+        common.logger.warning(
+            "CI auto-fix escalating for %s/%s#%s: %d attempts reached, disabling auto-fix",
+            repo_config["owner"],
+            repo_config["name"],
+            pr_number,
+            attempts,
+        )
+        await _escalate_ci_autofix(
+            repo_config=repo_config,
+            pr_number=pr_number,
+            thread_id=thread_id,
+            github_login=github_login,
+            app_token=app_token,
+        )
+        return
+
+    next_attempt = attempts + 1
     configurable: dict[str, Any] = {
         "repo": repo_config,
         "source": "github_ci",
@@ -1280,14 +1445,22 @@ async def process_github_ci_failure(  # noqa: PLR0911, PLR0912, PLR0915
         if metadata.get(key):
             configurable[key] = metadata[key]
 
-    prompt = _build_ci_autofix_prompt(pr_number=pr_number, head_sha=head_sha, failing=novel)
+    prompt = _build_ci_autofix_prompt(
+        pr_number=pr_number,
+        head_sha=head_sha,
+        failing=novel,
+        attempt=next_attempt,
+        max_attempts=CI_AUTOFIX_MAX_ATTEMPTS,
+    )
     common.logger.info(
-        "Dispatching CI auto-fix run for %s/%s#%s@%s (thread=%s, %d failing check(s))",
+        "Dispatching CI auto-fix run for %s/%s#%s@%s (thread=%s, attempt=%d/%d, %d failing check(s))",
         repo_config["owner"],
         repo_config["name"],
         pr_number,
         head_sha,
         thread_id,
+        next_attempt,
+        CI_AUTOFIX_MAX_ATTEMPTS,
         len(novel),
     )
     await common.dispatch_agent_run(
@@ -1297,3 +1470,4 @@ async def process_github_ci_failure(  # noqa: PLR0911, PLR0912, PLR0915
         source="github_ci",
         metadata=common._AGENT_VERSION_METADATA,
     )
+    await _set_ci_autofix_attempts(thread_id, next_attempt)

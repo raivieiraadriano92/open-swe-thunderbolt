@@ -80,6 +80,17 @@ def _stub_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(webhook_common, "_reviewer_token_for_repo", fake_token)
 
 
+@pytest.fixture(autouse=True)
+def _default_stub_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the langgraph client to an in-memory fake — tests that need a
+    specific thread search result can call ``_stub_thread_search`` to override.
+
+    Without this, ``_find_agent_thread_for_pr`` and ``_set_ci_autofix_attempts``
+    would hit the real langgraph URL and hang on connect timeouts.
+    """
+    _stub_thread_search(monkeypatch, [])
+
+
 def _stub_dispatch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
     async def fake_dispatch(
         thread_id: str,
@@ -101,18 +112,33 @@ def _stub_dispatch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) ->
     monkeypatch.setattr(webhook_common, "dispatch_agent_run", fake_dispatch)
 
 
-def _stub_thread_search(monkeypatch: pytest.MonkeyPatch, threads: list[dict[str, Any]]) -> None:
+def _stub_thread_search(
+    monkeypatch: pytest.MonkeyPatch, threads: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Install a fake langgraph client. Returns a dict that captures every
+    ``threads.update`` call (keyed by thread_id → merged metadata), so tests
+    can assert the attempt counter was written correctly.
+    """
+    updated_metadata: dict[str, Any] = {}
+
     class FakeThreads:
         async def search(self, *, metadata: dict[str, Any], limit: int) -> list[dict[str, Any]]:  # noqa: ARG002
             return threads
 
+        async def update(self, *, thread_id: str, metadata: dict[str, Any]) -> None:
+            existing = updated_metadata.setdefault(thread_id, {})
+            existing.update(metadata)
+
+    fake_threads = FakeThreads()
+
     class FakeClient:
-        threads = FakeThreads()
+        threads = fake_threads
 
     def fake_get_client(*_a: Any, **_kw: Any) -> Any:
         return FakeClient()
 
     monkeypatch.setattr(webhook_common, "get_client", fake_get_client)
+    return updated_metadata
 
 
 def test_check_run_failure_dispatches_autofix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -418,7 +444,191 @@ def test_reserve_ci_autofix_slot_atomic() -> None:
 
 
 def test_non_failing_ci_event_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A completed-success check-run must not trigger auto-fix."""
+    """A completed-success check-run must not trigger auto-fix.
+
+    (This is the pre-attempt-counter behavior: with no agent thread stubbed,
+    ``_find_agent_thread_for_pr`` short-circuits so we never even fetch the
+    failing state.)
+    """
+    dispatch_count = {"n": 0}
+
+    async def fake_dispatch(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        dispatch_count["n"] += 1
+        return {"run_id": "x"}
+
+    async def fake_fetch_pr(**_kw: Any) -> dict[str, Any]:
+        return {
+            "number": 42,
+            "html_url": "https://github.com/acme/app/pull/42",
+            "base": {"sha": "b"},
+        }
+
+    monkeypatch.setattr(github_webhooks, "fetch_open_pr_for_branch", fake_fetch_pr)
+    monkeypatch.setattr(webhook_common, "dispatch_agent_run", fake_dispatch)
+
+    client = TestClient(app)
+    resp = _post_github(client, "check_run", _check_run_payload(conclusion="success"))
+
+    assert resp.status_code == 200
+    assert dispatch_count["n"] == 0
+
+
+def _fakes_for_gate_tests(
+    monkeypatch: pytest.MonkeyPatch, *, autofix_disabled: bool = False
+) -> None:
+    """Wire the minimal fakes for tests exercising the attempt-gate logic."""
+
+    async def fake_fetch_pr(**_kw: Any) -> dict[str, Any]:
+        return {
+            "number": 42,
+            "html_url": "https://github.com/acme/app/pull/42",
+            "base": {"sha": "base"},
+        }
+
+    async def fake_failing_checks(**_kw: Any) -> list[dict[str, Any]]:
+        return [{"name": "typecheck", "conclusion": "failure", "details_url": ""}]
+
+    async def fake_failing_statuses(**_kw: Any) -> list[dict[str, Any]]:
+        return []
+
+    async def fake_base_names(**_kw: Any) -> set[str]:
+        return set()
+
+    async def fake_autofix_disabled(*_a: Any, **_kw: Any) -> bool:
+        return autofix_disabled
+
+    monkeypatch.setattr(github_webhooks, "fetch_open_pr_for_branch", fake_fetch_pr)
+    monkeypatch.setattr(github_webhooks, "list_failing_check_runs", fake_failing_checks)
+    monkeypatch.setattr(github_webhooks, "list_failing_statuses", fake_failing_statuses)
+    monkeypatch.setattr(github_webhooks, "names_failing_on_base", fake_base_names)
+    monkeypatch.setattr(github_webhooks, "is_pr_autofix_disabled", fake_autofix_disabled)
+
+
+def test_attempt_counter_increments_on_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each dispatch must bump the ``ci_autofix_attempts`` metadata key by 1."""
+    _fakes_for_gate_tests(monkeypatch)
+    captured_updates = _stub_thread_search(
+        monkeypatch,
+        [
+            {
+                "thread_id": "t-1",
+                "metadata": {
+                    "kind": "agent",
+                    "pr_url": "https://github.com/acme/app/pull/42",
+                    "ci_autofix_attempts": 1,  # Already one attempt on the record.
+                },
+            }
+        ],
+    )
+
+    async def fake_dispatch(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        return {"run_id": "run"}
+
+    monkeypatch.setattr(webhook_common, "dispatch_agent_run", fake_dispatch)
+
+    client = TestClient(app)
+    resp = _post_github(client, "check_run", _check_run_payload())
+    assert resp.status_code == 200
+
+    assert captured_updates.get("t-1", {}).get("ci_autofix_attempts") == 2
+
+
+def test_escalation_when_max_attempts_reached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After MAX attempts, no more dispatch — post comment + disable auto-fix."""
+    _fakes_for_gate_tests(monkeypatch)
+    _stub_thread_search(
+        monkeypatch,
+        [
+            {
+                "thread_id": "t-1",
+                "metadata": {
+                    "kind": "agent",
+                    "pr_url": "https://github.com/acme/app/pull/42",
+                    "github_login": "octocat",
+                    "ci_autofix_attempts": github_webhooks.CI_AUTOFIX_MAX_ATTEMPTS,
+                },
+            }
+        ],
+    )
+
+    dispatch_count = {"n": 0}
+    comment_calls: list[dict[str, Any]] = []
+    disable_calls: list[tuple[str, str, int, bool]] = []
+
+    async def fake_dispatch(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        dispatch_count["n"] += 1
+        return {"run_id": "x"}
+
+    async def fake_comment(
+        repo_config: dict[str, str],
+        issue_number: int,
+        body: str,
+        *,
+        token: str,
+        thread_id: str | None = None,
+    ) -> bool:
+        comment_calls.append(
+            {
+                "repo": repo_config,
+                "pr": issue_number,
+                "body": body,
+                "thread_id": thread_id,
+            }
+        )
+        return True
+
+    async def fake_disable(owner: str, repo: str, pr_number: int, disabled: bool) -> None:
+        disable_calls.append((owner, repo, pr_number, disabled))
+
+    monkeypatch.setattr(webhook_common, "dispatch_agent_run", fake_dispatch)
+    monkeypatch.setattr(github_webhooks, "post_github_comment", fake_comment)
+    monkeypatch.setattr(github_webhooks, "set_pr_autofix_disabled", fake_disable)
+
+    client = TestClient(app)
+    resp = _post_github(client, "check_run", _check_run_payload())
+    assert resp.status_code == 200
+
+    assert dispatch_count["n"] == 0
+    assert len(comment_calls) == 1
+    assert "3 automatic fix attempts" in comment_calls[0]["body"]
+    assert "@octocat" in comment_calls[0]["body"]
+    assert disable_calls == [("acme", "app", 42, True)]
+
+
+def test_reset_counter_on_green_ci(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A completed CI event with no failing checks resets the attempt counter."""
+
+    async def fake_fetch_pr(**_kw: Any) -> dict[str, Any]:
+        return {
+            "number": 42,
+            "html_url": "https://github.com/acme/app/pull/42",
+            "base": {"sha": "b"},
+        }
+
+    async def fake_failing_checks(**_kw: Any) -> list[dict[str, Any]]:
+        return []  # Everything green.
+
+    async def fake_failing_statuses(**_kw: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(github_webhooks, "fetch_open_pr_for_branch", fake_fetch_pr)
+    monkeypatch.setattr(github_webhooks, "list_failing_check_runs", fake_failing_checks)
+    monkeypatch.setattr(github_webhooks, "list_failing_statuses", fake_failing_statuses)
+
+    captured_updates = _stub_thread_search(
+        monkeypatch,
+        [
+            {
+                "thread_id": "t-green",
+                "metadata": {
+                    "kind": "agent",
+                    "pr_url": "https://github.com/acme/app/pull/42",
+                    "ci_autofix_attempts": 2,  # Prior failure streak worth resetting.
+                },
+            }
+        ],
+    )
+
     dispatch_count = {"n": 0}
 
     async def fake_dispatch(*_a: Any, **_kw: Any) -> dict[str, Any]:
@@ -429,6 +639,112 @@ def test_non_failing_ci_event_is_ignored(monkeypatch: pytest.MonkeyPatch) -> Non
 
     client = TestClient(app)
     resp = _post_github(client, "check_run", _check_run_payload(conclusion="success"))
-
     assert resp.status_code == 200
+
     assert dispatch_count["n"] == 0
+    assert captured_updates.get("t-green", {}).get("ci_autofix_attempts") == 0
+
+
+def test_green_ci_with_zero_attempts_does_not_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-op path: a green event on a PR with no prior attempts shouldn't
+    write to the thread — saves an update call and avoids spurious warnings.
+    """
+
+    async def fake_fetch_pr(**_kw: Any) -> dict[str, Any]:
+        return {
+            "number": 42,
+            "html_url": "https://github.com/acme/app/pull/42",
+            "base": {"sha": "b"},
+        }
+
+    async def fake_failing_checks(**_kw: Any) -> list[dict[str, Any]]:
+        return []
+
+    async def fake_failing_statuses(**_kw: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(github_webhooks, "fetch_open_pr_for_branch", fake_fetch_pr)
+    monkeypatch.setattr(github_webhooks, "list_failing_check_runs", fake_failing_checks)
+    monkeypatch.setattr(github_webhooks, "list_failing_statuses", fake_failing_statuses)
+
+    captured_updates = _stub_thread_search(
+        monkeypatch,
+        [
+            {
+                "thread_id": "t-fresh",
+                "metadata": {
+                    "kind": "agent",
+                    "pr_url": "https://github.com/acme/app/pull/42",
+                    # No ci_autofix_attempts set → counter is 0.
+                },
+            }
+        ],
+    )
+
+    client = TestClient(app)
+    resp = _post_github(client, "check_run", _check_run_payload(conclusion="success"))
+    assert resp.status_code == 200
+
+    assert "t-fresh" not in captured_updates
+
+
+def test_in_progress_ci_event_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``status`` field != completed → we don't touch the thread at all."""
+
+    async def fake_fetch_pr(**_kw: Any) -> dict[str, Any]:
+        raise AssertionError("should not reach fetch_open_pr_for_branch")
+
+    monkeypatch.setattr(github_webhooks, "fetch_open_pr_for_branch", fake_fetch_pr)
+
+    payload = _check_run_payload()
+    payload["check_run"]["status"] = "in_progress"
+
+    client = TestClient(app)
+    resp = _post_github(client, "check_run", payload)
+    assert resp.status_code == 200
+    # Handler exits early — no error, no fetch.
+
+
+def test_final_attempt_prompt_mentions_last_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Nth (last) attempt's prompt tells the agent to explain-and-stop
+    rather than try another speculative fix.
+    """
+    _fakes_for_gate_tests(monkeypatch)
+    _stub_thread_search(
+        monkeypatch,
+        [
+            {
+                "thread_id": "t-last",
+                "metadata": {
+                    "kind": "agent",
+                    "pr_url": "https://github.com/acme/app/pull/42",
+                    # attempts=MAX-1 means the run we're about to dispatch IS
+                    # the final attempt (attempt=MAX).
+                    "ci_autofix_attempts": github_webhooks.CI_AUTOFIX_MAX_ATTEMPTS - 1,
+                },
+            }
+        ],
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_dispatch(
+        thread_id: str,
+        content: Any,
+        configurable: dict[str, Any],
+        **_kw: Any,
+    ) -> dict[str, Any]:
+        captured["content"] = content
+        return {"run_id": "x"}
+
+    monkeypatch.setattr(webhook_common, "dispatch_agent_run", fake_dispatch)
+
+    client = TestClient(app)
+    resp = _post_github(client, "check_run", _check_run_payload())
+    assert resp.status_code == 200
+
+    assert "final auto-fix attempt" in captured["content"]
+    assert (
+        f"attempt {github_webhooks.CI_AUTOFIX_MAX_ATTEMPTS} of {github_webhooks.CI_AUTOFIX_MAX_ATTEMPTS}"
+        in captured["content"]
+    )
